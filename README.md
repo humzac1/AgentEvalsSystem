@@ -1,4 +1,4 @@
-# Agent Simulation Lab — HR Onboarding Edition
+# Agent Simulation Lab HR Onboarding Edition
 
 A mini simulation lab that runs an AI agent through realistic multi-turn conversations with synthetic users, scores each conversation automatically, and logs the trajectories as training-ready data.
 
