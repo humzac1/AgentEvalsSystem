@@ -25,6 +25,7 @@ from database import (
     get_all_batches,
     get_all_prompt_versions,
     get_active_prompt,
+    get_batch_sessions_summary,
 )
 from optimizer import run_optimization_iteration
 
@@ -75,6 +76,11 @@ def get_analytics_data():
 @app.get("/api/batches")
 def list_batches():
     return {"batches": get_all_batches()}
+
+
+@app.get("/api/batches/{batch_id}/sessions-summary")
+def batch_sessions_summary(batch_id: str):
+    return {"profiles": get_batch_sessions_summary(batch_id)}
 
 
 @app.get("/api/prompt-versions")

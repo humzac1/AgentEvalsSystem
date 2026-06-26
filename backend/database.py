@@ -93,6 +93,7 @@ def init_db() -> None:
                 avg_handling REAL,
                 avg_accuracy REAL,
                 optimizer_accepted INTEGER DEFAULT 0,
+                in_optimizer_run INTEGER DEFAULT 0,
                 FOREIGN KEY (prompt_version_id) REFERENCES prompt_versions(version_id)
             );
 
@@ -100,7 +101,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_evaluations_session ON evaluations(session_id);
         """)
 
-        # Step 2: safe migration — add new columns to sessions if they don't exist yet
+        # Step 2: safe migration — add new columns to sessions and batches if they don't exist yet
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
         }
@@ -111,6 +112,12 @@ def init_db() -> None:
         ]:
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {definition}")
+
+        existing_batch_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(batches)").fetchall()
+        }
+        if "in_optimizer_run" not in existing_batch_cols:
+            conn.execute("ALTER TABLE batches ADD COLUMN in_optimizer_run INTEGER DEFAULT 0")
 
         # Step 3: create indexes that depend on the migrated columns
         conn.executescript("""
@@ -194,13 +201,17 @@ def set_active_prompt_version(version_id: int) -> None:
 
 # ── Batch helpers ─────────────────────────────────────────────────────────────
 
-def create_batch(batch_id: str, prompt_version_id: int | None = None) -> None:
+def create_batch(
+    batch_id: str,
+    prompt_version_id: int | None = None,
+    in_optimizer_run: bool = False,
+) -> None:
     """Create a batch record."""
     with get_connection() as conn:
         conn.execute(
-            """INSERT INTO batches (batch_id, prompt_version_id, ran_at)
-               VALUES (?, ?, ?)""",
-            (batch_id, prompt_version_id, datetime.utcnow().isoformat()),
+            """INSERT INTO batches (batch_id, prompt_version_id, ran_at, in_optimizer_run)
+               VALUES (?, ?, ?, ?)""",
+            (batch_id, prompt_version_id, datetime.utcnow().isoformat(), 1 if in_optimizer_run else 0),
         )
 
 
@@ -263,6 +274,23 @@ def mark_batch_accepted(batch_id: str, accepted: bool = True) -> None:
             "UPDATE batches SET optimizer_accepted = ? WHERE batch_id = ?",
             (1 if accepted else 0, batch_id),
         )
+
+
+def get_batch_sessions_summary(batch_id: str) -> list[dict]:
+    """Return per-profile goal achievement breakdown for a batch."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT s.user_profile,
+                      COUNT(*) as session_count,
+                      SUM(COALESCE(e.hidden_goal_achieved, 0)) as goals_achieved
+               FROM sessions s
+               LEFT JOIN evaluations e ON s.session_id = e.session_id
+               WHERE s.batch_id = ?
+               GROUP BY s.user_profile
+               ORDER BY s.user_profile""",
+            (batch_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ── Session write helpers ─────────────────────────────────────────────────────

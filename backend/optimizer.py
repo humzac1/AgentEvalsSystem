@@ -62,9 +62,10 @@ def _run_batch(
     difficulty: int = 1,
     verbose: bool = False,
     on_session_complete: Callable[[int, int], None] | None = None,
+    in_optimizer_run: bool = True,
 ) -> dict:
     """Run sessions_per_batch simulations, cycling through profiles evenly."""
-    create_batch(batch_id, prompt_version_id)
+    create_batch(batch_id, prompt_version_id, in_optimizer_run=in_optimizer_run)
 
     results = []
     for i in range(sessions_per_batch):
