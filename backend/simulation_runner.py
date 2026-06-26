@@ -27,12 +27,29 @@ class SimulationRunner:
         user_profile: One of 'confused_novice', 'impatient_expert', 'adversarial_user'
         hidden_goal: The goal the user is trying to accomplish
         verbose: If True, print conversation turns to stdout
+        difficulty: 1–5 difficulty rating for the synthetic user
+        batch_id: ID of the batch this simulation belongs to
+        prompt_version_id: ID of the prompt version used for the HR agent
+        prompt_override: If set, use this prompt text for the HR agent instead of DB lookup
     """
 
-    def __init__(self, user_profile: str, hidden_goal: str, verbose: bool = True):
+    def __init__(
+        self,
+        user_profile: str,
+        hidden_goal: str,
+        verbose: bool = True,
+        difficulty: int = 1,
+        batch_id: str | None = None,
+        prompt_version_id: int | None = None,
+        prompt_override: str | None = None,
+    ):
         self.user_profile = user_profile
         self.hidden_goal = hidden_goal
         self.verbose = verbose
+        self.difficulty = difficulty
+        self.batch_id = batch_id
+        self.prompt_version_id = prompt_version_id
+        self.prompt_override = prompt_override
         self.session_id = str(uuid.uuid4())
         self.transcript: list[dict] = []
         self.turn_number = 0
@@ -66,15 +83,23 @@ class SimulationRunner:
         self._log(f"SIMULATION START")
         self._log(f"Session ID : {self.session_id}")
         self._log(f"Profile    : {self.user_profile}")
+        self._log(f"Difficulty : {self.difficulty}")
         self._log(f"Goal       : {self.hidden_goal}")
         self._log(f"{'='*60}\n")
 
         # Persist session metadata
-        save_session(self.session_id, self.user_profile, self.hidden_goal)
+        save_session(
+            self.session_id,
+            self.user_profile,
+            self.hidden_goal,
+            difficulty=self.difficulty,
+            batch_id=self.batch_id,
+            prompt_version_id=self.prompt_version_id,
+        )
 
         # Instantiate agents fresh for this session
-        user_agent = get_user_agent(self.user_profile, self.hidden_goal)
-        hr_agent = get_hr_agent()
+        user_agent = get_user_agent(self.user_profile, self.hidden_goal, difficulty=self.difficulty)
+        hr_agent = get_hr_agent(prompt_override=self.prompt_override)
 
         conversation_complete = False
         user_turn_count = 0
@@ -152,6 +177,7 @@ class SimulationRunner:
             "session_id": self.session_id,
             "user_profile": self.user_profile,
             "hidden_goal": self.hidden_goal,
+            "difficulty": self.difficulty,
             "turn_count": self.turn_number,
             "conversation_complete": conversation_complete,
             "transcript": self.transcript,

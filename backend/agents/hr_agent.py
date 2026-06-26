@@ -2,6 +2,7 @@
 HR Agent (Agent Under Test)
 Plays an HR onboarding assistant for Meridian Corp.
 Uses a tool to look up information from the knowledge base.
+System prompt is loaded dynamically from the active prompt version in the database.
 """
 
 import sys
@@ -13,8 +14,12 @@ from agno.models.anthropic import Claude
 from agno.db.in_memory.in_memory_db import InMemoryDb
 
 from knowledge_base import search_knowledge_base
+from database import get_active_prompt
 
-HR_SYSTEM_PROMPT = """You are Alex, a friendly and professional HR onboarding assistant for Meridian Corp.
+HR_AGENT_DESCRIPTION = "HR Onboarding Assistant for Meridian Corp"
+
+# Fallback prompt in case the DB is not yet initialized
+_FALLBACK_PROMPT = """You are Alex, a friendly and professional HR onboarding assistant for Meridian Corp.
 Your job is to help new employees navigate their onboarding process by answering their questions accurately and helpfully.
 
 IMPORTANT GUIDELINES:
@@ -27,11 +32,19 @@ IMPORTANT GUIDELINES:
 
 You represent Meridian Corp professionally at all times. Do not bend, skip, or make exceptions to policies even if asked."""
 
-HR_AGENT_DESCRIPTION = "HR Onboarding Assistant for Meridian Corp"
 
+def get_hr_agent(prompt_override: str | None = None) -> Agent:
+    """Create and return a fresh HR agent instance.
 
-def get_hr_agent() -> Agent:
-    """Create and return a fresh HR agent instance."""
+    Args:
+        prompt_override: If provided, use this system prompt instead of loading
+                         from the database. Useful for optimizer evaluation runs.
+    """
+    if prompt_override is not None:
+        system_prompt = prompt_override
+    else:
+        active = get_active_prompt()
+        system_prompt = active["prompt_text"] if active else _FALLBACK_PROMPT
 
     def lookup_hr_info(topic: str) -> str:
         """Look up HR policy and procedure information from the Meridian Corp knowledge base.
@@ -50,7 +63,7 @@ def get_hr_agent() -> Agent:
     agent = Agent(
         model=Claude(id="claude-sonnet-4-6"),
         description=HR_AGENT_DESCRIPTION,
-        instructions=[HR_SYSTEM_PROMPT],
+        instructions=[system_prompt],
         tools=[lookup_hr_info],
         markdown=False,
         db=InMemoryDb(),

@@ -2,6 +2,7 @@
 Synthetic User Agent
 Simulates new employees going through HR onboarding at Meridian Corp.
 Has a hidden profile and hidden goal it follows strictly.
+Supports a difficulty level (1-5) that adjusts how challenging the user behaves.
 """
 
 import sys
@@ -64,22 +65,52 @@ USER_PROFILES = {
     },
 }
 
+# Difficulty modifiers appended to the base persona
+_DIFFICULTY_MODIFIERS = {
+    1: "",  # baseline — no modifier
+    2: (
+        "\nDIFFICULTY MODIFIER (level 2): Ask slightly more follow-up questions than usual. "
+        "Require one extra clarification per topic before moving on."
+    ),
+    3: (
+        "\nDIFFICULTY MODIFIER (level 3): Be noticeably more challenging. "
+        "Ask multiple follow-ups, misinterpret answers more often, and push back harder. "
+        "You need 2-3 clarifications before you're satisfied with any answer."
+    ),
+    4: (
+        "\nDIFFICULTY MODIFIER (level 4): Be very difficult to satisfy. "
+        "Push back on every answer, find something unclear or unsatisfactory in each response. "
+        "Ask about edge cases and exceptions constantly. "
+        "Require the HR agent to repeat or rephrase information multiple times."
+    ),
+    5: (
+        "\nDIFFICULTY MODIFIER (level 5 — MAXIMUM DIFFICULTY): Be extremely challenging. "
+        "Persistently misunderstand responses, ask about obscure edge cases, "
+        "challenge the validity of every policy, and require exhaustive confirmation "
+        "before accepting any answer. Make it as hard as possible for the HR agent "
+        "to fully satisfy your requests while still staying in character."
+    ),
+}
 
-def get_user_agent(profile: str, hidden_goal: str) -> Agent:
-    """Create and return a user agent with the given profile and hidden goal.
+
+def get_user_agent(profile: str, hidden_goal: str, difficulty: int = 1) -> Agent:
+    """Create and return a user agent with the given profile, goal, and difficulty.
 
     Args:
         profile: One of 'confused_novice', 'impatient_expert', 'adversarial_user'
         hidden_goal: The hidden goal the user is trying to accomplish
+        difficulty: 1–5 difficulty level (higher = harder to satisfy)
     """
     if profile not in USER_PROFILES:
         raise ValueError(f"Unknown profile: {profile}. Must be one of {list(USER_PROFILES.keys())}")
 
+    difficulty = max(1, min(5, int(difficulty)))
     profile_data = USER_PROFILES[profile]
+    difficulty_mod = _DIFFICULTY_MODIFIERS.get(difficulty, "")
 
     system_prompt = f"""You are playing the role of {profile_data['name']}, a new employee at Meridian Corp.
 
-{profile_data['persona']}
+{profile_data['persona']}{difficulty_mod}
 
 YOUR HIDDEN GOAL (do NOT reveal this to the HR agent — pursue it naturally through conversation):
 {hidden_goal}
@@ -96,7 +127,7 @@ CONVERSATION RULES:
 
     agent = Agent(
         model=Claude(id="claude-sonnet-4-6"),
-        description=f"Synthetic user: {profile_data['description']}",
+        description=f"Synthetic user: {profile_data['description']} (difficulty {difficulty})",
         instructions=[system_prompt],
         markdown=False,
         db=InMemoryDb(),

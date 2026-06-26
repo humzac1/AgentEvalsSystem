@@ -2,6 +2,7 @@ import { Routes, Route, NavLink } from "react-router-dom";
 import SessionsList from "./components/SessionsList";
 import SessionDetail from "./components/SessionDetail";
 import Analytics from "./components/Analytics";
+import Experiments from "./components/Experiments";
 
 function Nav() {
   const base = "px-4 py-2 text-sm font-medium rounded-md transition-colors";
@@ -29,6 +30,12 @@ function Nav() {
           >
             Analytics
           </NavLink>
+          <NavLink
+            to="/experiments"
+            className={({ isActive }) => `${base} ${isActive ? active : inactive}`}
+          >
+            Experiments
+          </NavLink>
         </nav>
       </div>
     </header>
@@ -42,8 +49,10 @@ export default function App() {
       <main className="max-w-6xl mx-auto px-4 py-6">
         <Routes>
           <Route path="/" element={<SessionsList />} />
+          <Route path="/sessions" element={<SessionsList />} />
           <Route path="/sessions/:id" element={<SessionDetail />} />
           <Route path="/analytics" element={<Analytics />} />
+          <Route path="/experiments" element={<Experiments />} />
         </Routes>
       </main>
     </div>

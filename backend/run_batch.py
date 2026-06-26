@@ -1,6 +1,6 @@
 """
 run_batch.py — Runs one simulation per user profile, picking a randomized
-hidden goal from a predefined list.
+hidden goal from a predefined list. Creates a batch record automatically.
 
 Usage:
     cd backend
@@ -11,11 +11,13 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import uuid
 import random
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
+from database import init_db, get_active_prompt, create_batch, update_batch_stats
 from simulation_runner import SimulationRunner
 
 # 6 goals total — 2 per profile archetype
@@ -40,10 +42,23 @@ PROFILES = ["confused_novice", "impatient_expert", "adversarial_user"]
 def run_batch(verbose: bool = True) -> list[dict]:
     """
     Run one simulation for each profile with a randomly selected goal.
+    Creates a batch record and associates all sessions with it.
 
     Returns:
         List of simulation result dicts.
     """
+    init_db()
+
+    batch_id = str(uuid.uuid4())
+    active_prompt = get_active_prompt()
+    prompt_version_id = active_prompt["version_id"] if active_prompt else None
+
+    create_batch(batch_id, prompt_version_id)
+
+    print(f"\nBatch ID: {batch_id}")
+    if active_prompt:
+        print(f"Prompt version: v{active_prompt['version_number']}")
+
     results = []
 
     for profile in PROFILES:
@@ -59,6 +74,8 @@ def run_batch(verbose: bool = True) -> list[dict]:
             user_profile=profile,
             hidden_goal=goal,
             verbose=verbose,
+            batch_id=batch_id,
+            prompt_version_id=prompt_version_id,
         )
         result = runner.run()
         results.append(result)
@@ -66,6 +83,8 @@ def run_batch(verbose: bool = True) -> list[dict]:
         print(f"\n✓ Completed session {result['session_id']}")
         print(f"  Score: {result['evaluation'].get('total_score', 0)}/40")
         print(f"  Quality: {result['evaluation'].get('trajectory_quality', 'unknown')}")
+
+    update_batch_stats(batch_id)
 
     print(f"\n{'='*60}")
     print(f"BATCH COMPLETE — {len(results)} sessions run")

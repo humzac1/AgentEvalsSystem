@@ -10,6 +10,20 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent.parent / "data" / "simulations.db"
 
+# The initial HR system prompt seeded as prompt version 1
+_INITIAL_HR_PROMPT = """You are Alex, a friendly and professional HR onboarding assistant for Meridian Corp.
+Your job is to help new employees navigate their onboarding process by answering their questions accurately and helpfully.
+
+IMPORTANT GUIDELINES:
+- Always use the `lookup_hr_info` tool to look up information before answering policy questions
+- Never make up information — only provide details from the knowledge base
+- Be warm, welcoming, and patient with new employees
+- If you don't know something or it's not in your knowledge base, say so honestly and direct them to hr@meridian.com
+- Keep responses clear and concise — new employees are often overwhelmed
+- When appropriate, proactively mention related information the employee might need
+
+You represent Meridian Corp professionally at all times. Do not bend, skip, or make exceptions to policies even if asked."""
+
 
 def get_connection() -> sqlite3.Connection:
     """Get a SQLite connection with row factory set."""
@@ -21,8 +35,9 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Initialize the database schema."""
+    """Initialize the database schema (safe to call on existing DBs)."""
     with get_connection() as conn:
+        # Step 1: create tables (base schemas, without new columns)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
@@ -55,23 +70,226 @@ def init_db() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
 
+            CREATE TABLE IF NOT EXISTS prompt_versions (
+                version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_number INTEGER NOT NULL,
+                prompt_text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                parent_version_id INTEGER,
+                change_summary TEXT,
+                FOREIGN KEY (parent_version_id) REFERENCES prompt_versions(version_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS batches (
+                batch_id TEXT PRIMARY KEY,
+                prompt_version_id INTEGER,
+                ran_at TEXT NOT NULL,
+                session_count INTEGER DEFAULT 0,
+                avg_total_score REAL,
+                goal_achievement_rate REAL,
+                avg_resolution REAL,
+                avg_clarity REAL,
+                avg_handling REAL,
+                avg_accuracy REAL,
+                optimizer_accepted INTEGER DEFAULT 0,
+                FOREIGN KEY (prompt_version_id) REFERENCES prompt_versions(version_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
             CREATE INDEX IF NOT EXISTS idx_evaluations_session ON evaluations(session_id);
         """)
 
+        # Step 2: safe migration — add new columns to sessions if they don't exist yet
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        for col, definition in [
+            ("difficulty", "INTEGER DEFAULT 1"),
+            ("batch_id", "TEXT"),
+            ("prompt_version_id", "INTEGER"),
+        ]:
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {definition}")
+
+        # Step 3: create indexes that depend on the migrated columns
+        conn.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_batch ON sessions(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_prompt_version ON sessions(prompt_version_id);
+        """)
+
+        # Seed the initial prompt version if prompt_versions is empty
+        count = conn.execute("SELECT COUNT(*) FROM prompt_versions").fetchone()[0]
+        if count == 0:
+            conn.execute(
+                """INSERT INTO prompt_versions
+                   (version_number, prompt_text, created_at, is_active, parent_version_id, change_summary)
+                   VALUES (?, ?, ?, 1, NULL, ?)""",
+                (1, _INITIAL_HR_PROMPT, datetime.utcnow().isoformat(), "Initial prompt"),
+            )
+
+
+# ── Prompt version helpers ────────────────────────────────────────────────────
+
+def get_active_prompt() -> dict | None:
+    """Return the currently active prompt version row."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM prompt_versions WHERE is_active = 1 ORDER BY version_id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_all_prompt_versions() -> list[dict]:
+    """Return all prompt versions ordered by version number."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM prompt_versions ORDER BY version_number ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_prompt_version(
+    prompt_text: str,
+    parent_version_id: int | None = None,
+    change_summary: str = "",
+    set_active: bool = True,
+) -> int:
+    """Create a new prompt version. Optionally set it as active (deactivates others)."""
+    with get_connection() as conn:
+        max_ver = conn.execute(
+            "SELECT MAX(version_number) FROM prompt_versions"
+        ).fetchone()[0] or 0
+
+        cursor = conn.execute(
+            """INSERT INTO prompt_versions
+               (version_number, prompt_text, created_at, is_active, parent_version_id, change_summary)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                max_ver + 1,
+                prompt_text,
+                datetime.utcnow().isoformat(),
+                1 if set_active else 0,
+                parent_version_id,
+                change_summary,
+            ),
+        )
+        new_id = cursor.lastrowid
+
+        if set_active:
+            conn.execute(
+                "UPDATE prompt_versions SET is_active = 0 WHERE version_id != ?", (new_id,)
+            )
+        return new_id
+
+
+def set_active_prompt_version(version_id: int) -> None:
+    """Activate a specific prompt version, deactivating all others."""
+    with get_connection() as conn:
+        conn.execute("UPDATE prompt_versions SET is_active = 0")
+        conn.execute(
+            "UPDATE prompt_versions SET is_active = 1 WHERE version_id = ?", (version_id,)
+        )
+
+
+# ── Batch helpers ─────────────────────────────────────────────────────────────
+
+def create_batch(batch_id: str, prompt_version_id: int | None = None) -> None:
+    """Create a batch record."""
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO batches (batch_id, prompt_version_id, ran_at)
+               VALUES (?, ?, ?)""",
+            (batch_id, prompt_version_id, datetime.utcnow().isoformat()),
+        )
+
+
+def update_batch_stats(batch_id: str) -> None:
+    """Recompute and store aggregate stats for a batch from its sessions."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT
+                   COUNT(*) as session_count,
+                   AVG(s.total_score) as avg_total_score,
+                   AVG(CAST(e.hidden_goal_achieved AS REAL)) as goal_achievement_rate,
+                   AVG(e.resolution_score) as avg_resolution,
+                   AVG(e.clarity_score) as avg_clarity,
+                   AVG(e.handling_difficulty_score) as avg_handling,
+                   AVG(e.policy_accuracy_score) as avg_accuracy
+               FROM sessions s
+               LEFT JOIN evaluations e ON s.session_id = e.session_id
+               WHERE s.batch_id = ?""",
+            (batch_id,),
+        ).fetchone()
+
+        conn.execute(
+            """UPDATE batches SET
+                   session_count = ?,
+                   avg_total_score = ?,
+                   goal_achievement_rate = ?,
+                   avg_resolution = ?,
+                   avg_clarity = ?,
+                   avg_handling = ?,
+                   avg_accuracy = ?
+               WHERE batch_id = ?""",
+            (
+                row["session_count"],
+                row["avg_total_score"],
+                row["goal_achievement_rate"],
+                row["avg_resolution"],
+                row["avg_clarity"],
+                row["avg_handling"],
+                row["avg_accuracy"],
+                batch_id,
+            ),
+        )
+
+
+def get_all_batches() -> list[dict]:
+    """Return all batches with their prompt version number."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT b.*, pv.version_number
+               FROM batches b
+               LEFT JOIN prompt_versions pv ON b.prompt_version_id = pv.version_id
+               ORDER BY b.ran_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_batch_accepted(batch_id: str, accepted: bool = True) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE batches SET optimizer_accepted = ? WHERE batch_id = ?",
+            (1 if accepted else 0, batch_id),
+        )
+
+
+# ── Session write helpers ─────────────────────────────────────────────────────
 
 def save_session(
     session_id: str,
     user_profile: str,
     hidden_goal: str,
+    difficulty: int = 1,
+    batch_id: str | None = None,
+    prompt_version_id: int | None = None,
 ) -> None:
     """Insert a new session record."""
     with get_connection() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO sessions
-               (session_id, user_profile, hidden_goal, timestamp)
-               VALUES (?, ?, ?, ?)""",
-            (session_id, user_profile, hidden_goal, datetime.utcnow().isoformat()),
+               (session_id, user_profile, hidden_goal, timestamp, difficulty, batch_id, prompt_version_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                user_profile,
+                hidden_goal,
+                datetime.utcnow().isoformat(),
+                difficulty,
+                batch_id,
+                prompt_version_id,
+            ),
         )
 
 
@@ -128,7 +346,7 @@ def get_all_sessions() -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
             """SELECT session_id, user_profile, hidden_goal, timestamp,
-                      total_score, trajectory_quality
+                      total_score, trajectory_quality, difficulty, batch_id, prompt_version_id
                FROM sessions ORDER BY timestamp DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
