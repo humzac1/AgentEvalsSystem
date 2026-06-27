@@ -21,10 +21,10 @@ interface ProfileStat {
   session_count: number;
   avg_total_score: number | null;
   goals_achieved: number;
-  avg_resolution: number | null;
-  avg_clarity: number | null;
+  avg_goal_achievement: number | null;
+  avg_response_quality: number | null;
   avg_handling: number | null;
-  avg_accuracy: number | null;
+  avg_staying_in_scope: number | null;
 }
 
 interface QualityDist {
@@ -70,13 +70,14 @@ const QUALITY_COLORS: Record<string, string> = {
 };
 
 function ScoreHistogram({ scores }: { scores: number[] }) {
-  // Build bins: 0-9, 10-19, 20-29, 30-39, 40
+  // Build bins: 0-9, 10-19, 20-29, 30-39, 40-49, 50
   const bins = [
     { range: "0–9", min: 0, max: 10 },
     { range: "10–19", min: 10, max: 20 },
     { range: "20–29", min: 20, max: 30 },
     { range: "30–39", min: 30, max: 40 },
-    { range: "40", min: 40, max: 41 },
+    { range: "40–49", min: 40, max: 50 },
+    { range: "50", min: 50, max: 51 },
   ];
 
   const data = bins.map((b) => ({
@@ -106,7 +107,7 @@ function ScoreHistogram({ scores }: { scores: number[] }) {
   );
 }
 
-export default function Analytics() {
+export default function Analytics({ agentId }: { agentId: string }) {
   const [data, setData] = useState<Analytics | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
@@ -115,8 +116,8 @@ export default function Analytics() {
 
   useEffect(() => {
     Promise.all([
-      fetch("/api/analytics").then((r) => r.json()),
-      fetch("/api/sessions").then((r) => r.json()),
+      fetch(`/api/agents/${agentId}/analytics`).then((r) => r.json()),
+      fetch(`/api/agents/${agentId}/sessions`).then((r) => r.json()),
     ])
       .then(([analyticsData, sessionsData]) => {
         setData(analyticsData);
@@ -193,7 +194,7 @@ export default function Analytics() {
                   data.score_distribution.length
                 ).toFixed(1)
               : "—"}
-            <span className="text-gray-600 text-sm font-normal">/40</span>
+            <span className="text-gray-600 text-sm font-normal">/50</span>
           </p>
         </div>
         <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
@@ -231,7 +232,7 @@ export default function Analytics() {
                 domain={[-0.5, profileScoreData.length - 0.5]}
                 hide
               />
-              <YAxis domain={[0, 40]} tick={{ fill: "#6b7280", fontSize: 11 }} axisLine={false} tickLine={false} />
+              <YAxis domain={[0, 50]} tick={{ fill: "#6b7280", fontSize: 11 }} axisLine={false} tickLine={false} />
               <Tooltip
                 contentStyle={{
                   backgroundColor: "#111827",
@@ -321,7 +322,7 @@ export default function Analytics() {
                             : "Novice"}
                         </span>
                         <span className="text-xs text-gray-400 ml-auto">
-                          {s.total_score}/40
+                          {s.total_score}/50
                         </span>
                       </button>
                     </li>

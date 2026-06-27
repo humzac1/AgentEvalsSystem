@@ -1,35 +1,83 @@
 """
-FastAPI backend — serves simulation data from SQLite to the React frontend.
+FastAPI backend — multi-agent platform API.
+
+Route structure:
+  /api/agents                                  — agent registry CRUD
+  /api/agents/{agent_id}/sessions              — simulation sessions
+  /api/agents/{agent_id}/analytics             — score analytics
+  /api/agents/{agent_id}/batches               — experiment batches
+  /api/agents/{agent_id}/prompt-versions       — prompt history
+  /api/agents/{agent_id}/run-simulation        — async optimization loop
+  /api/agents/{agent_id}/documents             — knowledge base documents
+  /api/agents/{agent_id}/personas              — synthetic user personas
+  /api/agents/{agent_id}/personas/generate    — AI-generate a persona from a description
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import json
 import uuid
 import threading
+import io
+from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+import anthropic as _anthropic
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
+from registry import (
+    init_registry,
+    register_agent,
+    get_all_agents,
+    get_agent,
+    agent_db_path,
+    update_agent_stats,
+    update_agent_identity,
+)
 from database import (
     init_db,
+    seed_initial_prompt,
     get_all_sessions,
     get_session,
     get_analytics,
     get_all_batches,
     get_all_prompt_versions,
     get_active_prompt,
+    create_prompt_version,
     get_batch_sessions_summary,
+    get_all_documents,
+    add_document,
+    delete_document,
+    get_all_personas,
+    add_persona,
+    update_persona,
+    delete_persona,
+    get_session_count,
+    get_avg_score,
+    # Tools
+    get_all_tools,
+    get_tool,
+    upsert_tool,
+    delete_tool,
+    upsert_tool_seed_data,
+    get_session_tool_calls,
+    # Tasks
+    get_all_tasks,
+    get_task,
+    upsert_task,
+    delete_task,
 )
 from optimizer import run_optimization_iteration
 
-app = FastAPI(title="Agent Sim Lab API", version="2.0.0")
+app = FastAPI(title="Agent Sim Lab API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,26 +87,234 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Track in-progress runs for polling
+# Track in-progress runs keyed by run_id
 _runs: dict[str, dict] = {}
 _runs_lock = threading.Lock()
 
 
+# ── Default system prompt for new agents ──────────────────────────────────────
+
+_DEFAULT_SYSTEM_PROMPT = """You are Alex, a friendly and professional HR onboarding assistant for Meridian Corp.
+Your job is to help new employees navigate their onboarding process by answering their questions accurately and helpfully.
+
+IMPORTANT GUIDELINES:
+- Always use the `lookup_hr_info` tool to look up information before answering policy questions
+- Never make up information — only provide details from the knowledge base
+- Be warm, welcoming, and patient with new employees
+- If you don't know something or it's not in your knowledge base, say so honestly and direct them to hr@meridian.com
+- Keep responses clear and concise — new employees are often overwhelmed
+- When appropriate, proactively mention related information the employee might need
+
+You represent Meridian Corp professionally at all times. Do not bend, skip, or make exceptions to policies even if asked."""
+
+
+# ── Startup ────────────────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 def startup_event():
-    init_db()
+    init_registry()
 
 
-# ── Sessions ──────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-@app.get("/api/sessions")
-def list_sessions():
-    return {"sessions": get_all_sessions()}
+def _resolve_agent(agent_id: str) -> Path:
+    """Return the DB path for an agent (running migrations if needed), or raise 404."""
+    record = get_agent(agent_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    db = agent_db_path(agent_id)
+    init_db(db_path=db)  # idempotent — ensures schema/columns are up to date
+    return db
 
 
-@app.get("/api/sessions/{session_id}")
-def get_session_detail(session_id: str):
-    session = get_session(session_id)
+def _extract_text(filename: str, content: bytes, content_type: str) -> str:
+    """Extract plain text from an uploaded file."""
+    # PDF
+    if content_type == "application/pdf" or filename.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            return "\n\n".join(pages).strip()
+        except ImportError:
+            raise HTTPException(
+                status_code=422,
+                detail="PDF support requires pypdf. Run: pip install pypdf",
+            )
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Could not parse PDF: {e}")
+
+    # Plain text / markdown / code
+    try:
+        return content.decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not decode file: {e}")
+
+
+def _refresh_agent_stats(agent_id: str, db: Path) -> None:
+    """Update the registry row with latest session count and avg score."""
+    try:
+        active = get_active_prompt(db_path=db)
+        active_ver = str(active["version_number"]) if active else None
+        update_agent_stats(
+            agent_id=agent_id,
+            session_count=get_session_count(db_path=db),
+            avg_score=get_avg_score(db_path=db),
+            active_prompt_version=active_ver,
+        )
+    except Exception:
+        pass  # best-effort — don't break the response
+
+
+# ── Agents CRUD ────────────────────────────────────────────────────────────────
+
+@app.get("/api/agents")
+def list_agents():
+    agents = get_all_agents()
+    # Refresh stats inline (cheap read-only queries)
+    enriched = []
+    for a in agents:
+        db = agent_db_path(a["agent_id"])
+        if db.exists():
+            try:
+                a["session_count"] = get_session_count(db_path=db)
+                a["avg_score"] = get_avg_score(db_path=db)
+                active = get_active_prompt(db_path=db)
+                a["active_prompt_version"] = str(active["version_number"]) if active else None
+            except Exception:
+                pass
+        enriched.append(a)
+    return {"agents": enriched}
+
+
+class CreateAgentRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(default="")
+    domain: str = Field(default="")
+    initial_prompt: Optional[str] = None
+    experiment_types: list[str] = Field(default_factory=lambda: ["conversation"])
+
+
+@app.post("/api/agents", status_code=201)
+def create_agent(request: CreateAgentRequest):
+    agent_id = str(uuid.uuid4())
+    db = agent_db_path(agent_id)
+    db.parent.mkdir(parents=True, exist_ok=True)
+
+    # Bootstrap the per-agent DB
+    init_db(db_path=db)
+    seed_initial_prompt(
+        prompt_text=request.initial_prompt or _DEFAULT_SYSTEM_PROMPT,
+        db_path=db,
+    )
+
+    # Register in global registry
+    register_agent(
+        agent_id=agent_id,
+        name=request.name,
+        description=request.description,
+        domain=request.domain,
+        db_path=str(db),
+        experiment_types=request.experiment_types,
+    )
+
+    return {"agent_id": agent_id, "name": request.name}
+
+
+@app.get("/api/agents/{agent_id}")
+def get_agent_detail(agent_id: str):
+    record = get_agent(agent_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    db = agent_db_path(agent_id)
+    if db.exists():
+        try:
+            record["session_count"] = get_session_count(db_path=db)
+            record["avg_score"] = get_avg_score(db_path=db)
+            active = get_active_prompt(db_path=db)
+            record["active_prompt_version"] = str(active["version_number"]) if active else None
+        except Exception:
+            pass
+    return record
+
+
+@app.get("/api/agents/{agent_id}/config")
+def get_agent_config(agent_id: str):
+    """Return full agent config: identity + active prompt + documents + personas + tools + tasks."""
+    record = get_agent(agent_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    db = _resolve_agent(agent_id)
+    active = get_active_prompt(db_path=db)
+    return {
+        "agent_id": record["agent_id"],
+        "name": record["name"],
+        "description": record["description"],
+        "domain": record["domain"],
+        "experiment_types": record["experiment_types"],
+        "active_prompt": active,
+        "documents": get_all_documents(db_path=db),
+        "personas": get_all_personas(db_path=db),
+        "tools": get_all_tools(db_path=db),
+        "tasks": get_all_tasks(db_path=db),
+    }
+
+
+class UpdateAgentRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(default="")
+    domain: str = Field(default="")
+    experiment_types: list[str] = Field(default_factory=lambda: ["conversation"])
+
+
+@app.put("/api/agents/{agent_id}")
+def update_agent(agent_id: str, request: UpdateAgentRequest):
+    """Update agent identity fields."""
+    record = get_agent(agent_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    update_agent_identity(
+        agent_id=agent_id,
+        name=request.name,
+        description=request.description,
+        domain=request.domain,
+        experiment_types=request.experiment_types,
+    )
+    return {"agent_id": agent_id, "name": request.name}
+
+
+class CreatePromptVersionRequest(BaseModel):
+    prompt_text: str = Field(..., min_length=1)
+    change_summary: str = Field(default="")
+    parent_version_id: Optional[int] = None
+
+
+@app.post("/api/agents/{agent_id}/prompt-versions", status_code=201)
+def add_prompt_version(agent_id: str, request: CreatePromptVersionRequest):
+    """Create a new prompt version and set it as active."""
+    db = _resolve_agent(agent_id)
+    version_id = create_prompt_version(
+        prompt_text=request.prompt_text,
+        parent_version_id=request.parent_version_id,
+        change_summary=request.change_summary,
+        set_active=True,
+        db_path=db,
+    )
+    return {"version_id": version_id}
+
+
+# ── Sessions ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/agents/{agent_id}/sessions")
+def list_sessions(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return {"sessions": get_all_sessions(db_path=db)}
+
+
+@app.get("/api/agents/{agent_id}/sessions/{session_id}")
+def get_session_detail(agent_id: str, session_id: str):
+    db = _resolve_agent(agent_id)
+    session = get_session(session_id, db_path=db)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
@@ -66,55 +322,49 @@ def get_session_detail(session_id: str):
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
 
-@app.get("/api/analytics")
-def get_analytics_data():
-    return get_analytics()
+@app.get("/api/agents/{agent_id}/analytics")
+def get_analytics_data(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return get_analytics(db_path=db)
 
 
-# ── Experiments ───────────────────────────────────────────────────────────────
+# ── Experiments / Batches ─────────────────────────────────────────────────────
 
-@app.get("/api/batches")
-def list_batches():
-    return {"batches": get_all_batches()}
-
-
-@app.get("/api/batches/{batch_id}/sessions-summary")
-def batch_sessions_summary(batch_id: str):
-    return {"profiles": get_batch_sessions_summary(batch_id)}
+@app.get("/api/agents/{agent_id}/batches")
+def list_batches(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return {"batches": get_all_batches(db_path=db)}
 
 
-@app.get("/api/prompt-versions")
-def list_prompt_versions():
-    versions = get_all_prompt_versions()
-    active = get_active_prompt()
+@app.get("/api/agents/{agent_id}/batches/{batch_id}/sessions-summary")
+def batch_sessions_summary(agent_id: str, batch_id: str):
+    db = _resolve_agent(agent_id)
+    return {"profiles": get_batch_sessions_summary(batch_id, db_path=db)}
+
+
+@app.get("/api/agents/{agent_id}/prompt-versions")
+def list_prompt_versions(agent_id: str):
+    db = _resolve_agent(agent_id)
+    versions = get_all_prompt_versions(db_path=db)
+    active = get_active_prompt(db_path=db)
     return {
         "versions": versions,
         "active_version_id": active["version_id"] if active else None,
     }
 
 
-# ── Run Simulation (full optimization loop, async) ────────────────────────────
-
-PHASE_LABELS = {
-    "eval":        "Running eval batch…",
-    "propose":     "Meta-agent rewriting prompt…",
-    "challenger":  "Running challenger batch…",
-    "decision":    "Comparing results…",
-}
-
+# ── Run Simulation (async optimization loop) ───────────────────────────────────
 
 class RunSimulationRequest(BaseModel):
     session_count: int = Field(default=3, ge=3, le=12)
     difficulty: int = Field(default=1, ge=1, le=5)
 
 
-@app.post("/api/run-simulation")
-def run_simulation(request: RunSimulationRequest):
-    """
-    Start one full optimization iteration asynchronously.
-    Poll GET /api/run-simulation/{run_id} for status.
-    """
-    # Snap session_count to a multiple of 3 (one per profile minimum)
+@app.post("/api/agents/{agent_id}/run-simulation")
+def run_simulation(agent_id: str, request: RunSimulationRequest):
+    """Start one full optimization iteration asynchronously."""
+    db = _resolve_agent(agent_id)
+    # Snap to a multiple of profile count (minimum 3)
     sessions = max(3, (request.session_count // 3) * 3)
 
     run_id = str(uuid.uuid4())
@@ -139,6 +389,7 @@ def run_simulation(request: RunSimulationRequest):
                 difficulty=request.difficulty,
                 verbose=False,
                 on_phase=on_phase,
+                db_path=db,
             )
             with _runs_lock:
                 _runs[run_id]["status"] = "complete"
@@ -150,6 +401,7 @@ def run_simulation(request: RunSimulationRequest):
                     "change_summary": result["change_summary"],
                     "decision": result["decision"],
                 }
+            _refresh_agent_stats(agent_id, db)
         except Exception as e:
             with _runs_lock:
                 _runs[run_id]["status"] = "error"
@@ -159,8 +411,646 @@ def run_simulation(request: RunSimulationRequest):
     return {"run_id": run_id, "status": "running"}
 
 
-@app.get("/api/run-simulation/{run_id}")
-def poll_simulation(run_id: str):
+@app.get("/api/agents/{agent_id}/run-simulation/{run_id}")
+def poll_simulation(agent_id: str, run_id: str):
+    # agent existence check (fast)
+    _resolve_agent(agent_id)
+    with _runs_lock:
+        state = _runs.get(run_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Run ID not found")
+    return state
+
+
+# ── Documents ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/agents/{agent_id}/documents")
+def list_documents(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return {"documents": get_all_documents(db_path=db)}
+
+
+@app.post("/api/agents/{agent_id}/documents", status_code=201)
+async def upload_document(agent_id: str, file: UploadFile = File(...)):
+    db = _resolve_agent(agent_id)
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
+
+    content_text = _extract_text(
+        filename=file.filename or "upload",
+        content=content,
+        content_type=file.content_type or "",
+    )
+    if not content_text:
+        raise HTTPException(status_code=422, detail="Could not extract any text from file")
+
+    doc_id = str(uuid.uuid4())
+    add_document(
+        doc_id=doc_id,
+        filename=file.filename or "upload",
+        file_type=file.content_type or "text/plain",
+        content_text=content_text,
+        file_size_bytes=len(content),
+        db_path=db,
+    )
+    return {"doc_id": doc_id, "filename": file.filename}
+
+
+@app.delete("/api/agents/{agent_id}/documents/{doc_id}", status_code=204)
+def remove_document(agent_id: str, doc_id: str):
+    db = _resolve_agent(agent_id)
+    delete_document(doc_id, db_path=db)
+
+
+# ── Personas ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/agents/{agent_id}/personas")
+def list_personas(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return {"personas": get_all_personas(db_path=db)}
+
+
+class CreatePersonaRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    description: str = Field(default="")
+    behavioral_instructions: str = Field(..., min_length=1)
+    difficulty_base: int = Field(default=1, ge=1, le=5)
+    hidden_goals: list[str] = Field(default_factory=list)
+
+
+@app.post("/api/agents/{agent_id}/personas", status_code=201)
+def create_persona(agent_id: str, request: CreatePersonaRequest):
+    db = _resolve_agent(agent_id)
+    persona_id = str(uuid.uuid4())
+    add_persona(
+        persona_id=persona_id,
+        name=request.name,
+        description=request.description,
+        behavioral_instructions=request.behavioral_instructions,
+        difficulty_base=request.difficulty_base,
+        hidden_goals=request.hidden_goals,
+        db_path=db,
+    )
+    return {"persona_id": persona_id, "name": request.name}
+
+
+@app.put("/api/agents/{agent_id}/personas/{persona_id}")
+def update_persona_endpoint(agent_id: str, persona_id: str, request: CreatePersonaRequest):
+    db = _resolve_agent(agent_id)
+    updated = update_persona(
+        persona_id=persona_id,
+        name=request.name,
+        description=request.description,
+        behavioral_instructions=request.behavioral_instructions,
+        difficulty_base=request.difficulty_base,
+        hidden_goals=request.hidden_goals,
+        db_path=db,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    return {"persona_id": persona_id, "name": request.name}
+
+
+@app.delete("/api/agents/{agent_id}/personas/{persona_id}", status_code=204)
+def remove_persona(agent_id: str, persona_id: str):
+    db = _resolve_agent(agent_id)
+    delete_persona(persona_id, db_path=db)
+
+
+class GeneratePersonaRequest(BaseModel):
+    description: str = Field(
+        ...,
+        min_length=10,
+        description="Plain-language description of the user type to generate",
+    )
+
+
+@app.post("/api/agents/{agent_id}/personas/generate", status_code=201)
+def generate_persona(agent_id: str, request: GeneratePersonaRequest):
+    """
+    Use Claude to generate a full persona from a plain-language description,
+    then save it to the agent's personas table.
+    """
+    db = _resolve_agent(agent_id)
+
+    prompt = f"""You are designing synthetic user personas for an AI agent evaluation platform.
+
+Generate a detailed persona based on this description:
+"{request.description}"
+
+Output ONLY a valid JSON object with exactly these fields:
+{{
+  "name": "<short display name, 2-4 words>",
+  "description": "<one sentence describing who this person is>",
+  "behavioral_instructions": "<2-4 paragraphs of specific behavioral rules the simulated user must follow, written in second person ('You are...'). Include communication style, how they react to unclear answers, and any quirks.>",
+  "difficulty_base": <integer 1-5, where 1=easy/cooperative and 5=very challenging>,
+  "hidden_goals": [
+    "<specific goal this user might want to accomplish in an HR onboarding conversation>",
+    "<another specific goal>",
+    "<a third specific goal>"
+  ]
+}}
+
+Rules:
+- hidden_goals must be concrete tasks achievable in a short HR chat (e.g. 'Find out how to enroll in health insurance')
+- behavioral_instructions must guide the LLM to simulate this persona consistently
+- Output ONLY the JSON object — no markdown, no explanation"""
+
+    client = _anthropic.Anthropic()
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.rsplit("```", 1)[0].strip()
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Claude returned invalid JSON: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
+
+    # Validate required fields
+    required = {"name", "description", "behavioral_instructions", "difficulty_base", "hidden_goals"}
+    missing = required - set(data.keys())
+    if missing:
+        raise HTTPException(status_code=500, detail=f"Claude response missing fields: {missing}")
+
+    persona_id = str(uuid.uuid4())
+    add_persona(
+        persona_id=persona_id,
+        name=str(data["name"]),
+        description=str(data["description"]),
+        behavioral_instructions=str(data["behavioral_instructions"]),
+        difficulty_base=max(1, min(5, int(data["difficulty_base"]))),
+        hidden_goals=list(data.get("hidden_goals", [])),
+        is_generated=True,
+        db_path=db,
+    )
+
+    return {
+        "persona_id": persona_id,
+        "name": data["name"],
+        "description": data["description"],
+        "difficulty_base": data["difficulty_base"],
+        "hidden_goals": data["hidden_goals"],
+    }
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/agents/{agent_id}/tools")
+def list_tools(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return {"tools": get_all_tools(db_path=db)}
+
+
+class UpsertToolRequest(BaseModel):
+    tool_id: Optional[str] = None
+    name: str = Field(..., min_length=1, max_length=80)
+    display_name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(..., min_length=1)
+    operation_type: str = Field(...)
+    collection_name: str = Field(..., min_length=1)
+    input_schema: dict = Field(default_factory=dict)
+    output_schema: dict = Field(default_factory=dict)
+    error_conditions: list = Field(default_factory=list)
+    seed_records: list = Field(default_factory=list)
+
+
+@app.post("/api/agents/{agent_id}/tools", status_code=201)
+def create_tool(agent_id: str, request: UpsertToolRequest):
+    db = _resolve_agent(agent_id)
+    tool_id = request.tool_id or str(uuid.uuid4())
+    upsert_tool(
+        tool_id=tool_id,
+        name=request.name,
+        display_name=request.display_name,
+        description=request.description,
+        operation_type=request.operation_type,
+        collection_name=request.collection_name,
+        input_schema=request.input_schema,
+        output_schema=request.output_schema,
+        error_conditions=request.error_conditions,
+        db_path=db,
+    )
+    if request.seed_records:
+        upsert_tool_seed_data(
+            seed_id=str(uuid.uuid4()),
+            tool_id=tool_id,
+            collection_name=request.collection_name,
+            records=request.seed_records,
+            db_path=db,
+        )
+    return {"tool_id": tool_id, "name": request.name}
+
+
+@app.put("/api/agents/{agent_id}/tools/{tool_id}")
+def update_tool(agent_id: str, tool_id: str, request: UpsertToolRequest):
+    db = _resolve_agent(agent_id)
+    upsert_tool(
+        tool_id=tool_id,
+        name=request.name,
+        display_name=request.display_name,
+        description=request.description,
+        operation_type=request.operation_type,
+        collection_name=request.collection_name,
+        input_schema=request.input_schema,
+        output_schema=request.output_schema,
+        error_conditions=request.error_conditions,
+        db_path=db,
+    )
+    if request.seed_records is not None:
+        upsert_tool_seed_data(
+            seed_id=str(uuid.uuid4()),
+            tool_id=tool_id,
+            collection_name=request.collection_name,
+            records=request.seed_records,
+            db_path=db,
+        )
+    return {"tool_id": tool_id, "name": request.name}
+
+
+@app.delete("/api/agents/{agent_id}/tools/{tool_id}", status_code=204)
+def remove_tool(agent_id: str, tool_id: str):
+    db = _resolve_agent(agent_id)
+    delete_tool(tool_id, db_path=db)
+
+
+class GenerateSeedRequest(BaseModel):
+    count: int = Field(default=5, ge=1, le=20)
+    context: str = Field(default="")
+
+
+@app.post("/api/agents/{agent_id}/tools/{tool_id}/generate-seed", status_code=201)
+def generate_seed_data(agent_id: str, tool_id: str, request: GenerateSeedRequest):
+    """Use Claude to generate realistic seed records for a tool."""
+    db = _resolve_agent(agent_id)
+    tool = get_tool(tool_id, db_path=db)
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    agent_record = get_agent(agent_id)
+    agent_context = f"Agent: {agent_record['name']}, Domain: {agent_record['domain']}" if agent_record else ""
+
+    prompt = f"""Generate {request.count} realistic seed records for this tool's data collection.
+
+{agent_context}
+Tool: {tool['display_name']} ({tool['operation_type']} on '{tool['collection_name']}')
+Description: {tool['description']}
+Input Schema: {json.dumps(tool.get('input_schema', {}), indent=2)}
+{f"Additional context: {request.context}" if request.context else ""}
+
+Generate realistic records that would exist in a real {agent_record.get('domain', 'business') if agent_record else 'business'} system.
+Each record should have an "id" field plus all relevant fields from the schema.
+
+Output ONLY a valid JSON array of {request.count} record objects. No explanation, no markdown."""
+
+    client = _anthropic.Anthropic()
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.rsplit("```", 1)[0].strip()
+        records = json.loads(raw)
+        if not isinstance(records, list):
+            records = [records]
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Claude returned invalid JSON: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
+
+    seed_id = str(uuid.uuid4())
+    upsert_tool_seed_data(
+        seed_id=seed_id,
+        tool_id=tool_id,
+        collection_name=tool["collection_name"],
+        records=records,
+        db_path=db,
+    )
+    return {"seed_id": seed_id, "records": records, "count": len(records)}
+
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/agents/{agent_id}/tasks")
+def list_tasks(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return {"tasks": get_all_tasks(db_path=db)}
+
+
+class UpsertTaskRequest(BaseModel):
+    task_id: Optional[str] = None
+    experiment_type: str = Field(...)
+    title: str = Field(..., min_length=1, max_length=120)
+    description: str = Field(..., min_length=1)
+    expected_tool_calls: list = Field(default_factory=list)
+    expected_final_state: dict = Field(default_factory=dict)
+
+
+@app.post("/api/agents/{agent_id}/tasks", status_code=201)
+def create_task(agent_id: str, request: UpsertTaskRequest):
+    db = _resolve_agent(agent_id)
+    task_id = request.task_id or str(uuid.uuid4())
+    upsert_task(
+        task_id=task_id,
+        experiment_type=request.experiment_type,
+        title=request.title,
+        description=request.description,
+        expected_tool_calls=request.expected_tool_calls,
+        expected_final_state=request.expected_final_state,
+        db_path=db,
+    )
+    return {"task_id": task_id, "title": request.title}
+
+
+@app.put("/api/agents/{agent_id}/tasks/{task_id}")
+def update_task_endpoint(agent_id: str, task_id: str, request: UpsertTaskRequest):
+    db = _resolve_agent(agent_id)
+    upsert_task(
+        task_id=task_id,
+        experiment_type=request.experiment_type,
+        title=request.title,
+        description=request.description,
+        expected_tool_calls=request.expected_tool_calls,
+        expected_final_state=request.expected_final_state,
+        db_path=db,
+    )
+    return {"task_id": task_id, "title": request.title}
+
+
+@app.delete("/api/agents/{agent_id}/tasks/{task_id}", status_code=204)
+def remove_task(agent_id: str, task_id: str):
+    db = _resolve_agent(agent_id)
+    delete_task(task_id, db_path=db)
+
+
+class GenerateTasksRequest(BaseModel):
+    experiment_type: str = Field(...)
+    count: int = Field(default=3, ge=1, le=10)
+    context: str = Field(default="")
+
+
+@app.post("/api/agents/{agent_id}/tasks/generate", status_code=201)
+def generate_tasks(agent_id: str, request: GenerateTasksRequest):
+    """Use Claude to generate tasks for a given experiment type."""
+    db = _resolve_agent(agent_id)
+    agent_record = get_agent(agent_id)
+    tools = get_all_tools(db_path=db)
+
+    # Build rich tool descriptions including input schemas and sample seed records
+    tool_blocks = []
+    for t in tools:
+        # Fetch full tool record (includes seed_data)
+        full_tool = get_tool(t["tool_id"], db_path=db) or t
+        schema_props = full_tool.get("input_schema", {}).get("properties", {})
+        params_str = ", ".join(
+            f"{k} ({v.get('type','any')}): {v.get('description','')}"
+            for k, v in schema_props.items()
+        )
+        seed_sample = ""
+        seed_data = full_tool.get("seed_data", [])
+        if seed_data:
+            records = seed_data[0].get("records", [])
+            if records:
+                # Show up to 3 sample records so Claude can reference real names/IDs
+                sample = records[:3]
+                seed_sample = f"\n  Sample records: {json.dumps(sample)}"
+        tool_blocks.append(
+            f"- {t['name']} ({t['operation_type']} on '{t['collection_name']}')\n"
+            f"  Description: {t['description']}\n"
+            f"  Inputs: {params_str or 'none'}"
+            + seed_sample
+        )
+    tool_section = "\n".join(tool_blocks) if tool_blocks else "No tools defined."
+
+    agent_name = agent_record["name"] if agent_record else "the agent"
+    agent_domain = agent_record["domain"] if agent_record else "general"
+    n = request.count
+    context_line = f"\nAdditional context: {request.context}" if request.context else ""
+
+    if request.experiment_type == "single_output":
+        prompt = f"""You are generating Single Output tasks for an AI agent simulation lab.
+
+A Single Output task has ALL of these properties:
+- Requires exactly 1-2 tool calls maximum to complete
+- Has one clear, atomic deliverable
+- Does not require the output of one tool call to feed into another
+- Can be fully completed in a single agent response
+
+Examples of good Single Output tasks for an invoicing agent:
+- "Look up customer Acme Corp and return their full billing record"
+- "List all invoices currently in overdue status"
+- "Calculate the total for 40 hours of software consulting at standard rates with a retainer discount"
+
+Examples of BAD Single Output tasks (too complex, belong in Multi-Step):
+- "Look up a customer, create an invoice, and send it" (3 chained tool calls)
+- "Find overdue invoices and create follow-up drafts" (multi-tool workflow)
+
+Generate {n} Single Output tasks for the following agent. Each task must be completable with 1-2 tool calls maximum. Tasks must be meaningfully different from each other — do not repeat the same tool or scenario.
+
+Agent: {agent_name}
+Domain: {agent_domain}{context_line}
+
+Available tools (use real names/IDs from the sample records in your task descriptions):
+{tool_section}
+
+Output ONLY a valid JSON array of {n} task objects with exactly these fields:
+[
+  {{
+    "title": "<short task title, under 60 chars>",
+    "description": "<full task description given to the agent — be specific, reference real record names/IDs from the seed data above>",
+    "expected_tool_calls": ["<tool_name>"],
+    "expected_final_state": {{"<collection>": "<what the result should contain>"}}
+  }}
+]
+
+Each task must use at most 2 tool calls. Return only the JSON array, no explanation."""
+
+    elif request.experiment_type == "multi_step":
+        prompt = f"""You are generating Multi-Step Agentic tasks for an AI agent simulation lab.
+
+A Multi-Step task has ALL of these properties:
+- Requires 3 or more tool calls chained in sequence
+- The output of one tool call is used as input to the next
+- Involves decision-making between steps (e.g. checking a result before proceeding)
+- Cannot be completed in a single tool call — the agent must plan and execute a workflow
+- Has a meaningful end state that can be verified (e.g. a record was created AND updated AND sent)
+
+Examples of good Multi-Step tasks for an invoicing agent:
+- "Look up customer Orion Logistics, calculate the total for 25 hours of project management at standard rates with their new client discount, create the invoice, then send it to their billing contact with a welcome message"
+- "List all overdue invoices, identify the customer with the highest overdue amount, look up their full record, and create a new draft invoice for the same amount"
+
+Examples of BAD Multi-Step tasks (too simple, belong in Single Output):
+- "Look up customer Acme Corp" (single tool call)
+- "List all invoices with status sent" (single tool call)
+
+Generate {n} Multi-Step tasks for the following agent. Each task must require at least 3 chained tool calls where step outputs feed into subsequent steps. Tasks must be meaningfully different from each other.
+
+Agent: {agent_name}
+Domain: {agent_domain}{context_line}
+
+Available tools (use real names/IDs from the sample records in your task descriptions):
+{tool_section}
+
+Output ONLY a valid JSON array of {n} task objects with exactly these fields:
+[
+  {{
+    "title": "<short task title, under 60 chars>",
+    "description": "<full task description given to the agent — be specific, reference real record names/IDs, describe the full workflow the agent must complete>",
+    "expected_tool_calls": ["<tool_name_step1>", "<tool_name_step2>", "<tool_name_step3>", ...],
+    "expected_final_state": {{"<collection>": "<what should exist after all steps complete>"}}
+  }}
+]
+
+Each task must list at least 3 tool calls in sequence. Return only the JSON array, no explanation."""
+
+    else:
+        # Fallback for any other experiment type
+        prompt = f"""Generate {n} realistic {request.experiment_type} tasks for this AI agent.
+
+Agent: {agent_name}
+Domain: {agent_domain}{context_line}
+
+Available tools:
+{tool_section}
+
+Output ONLY a valid JSON array of {n} task objects with exactly these fields:
+[
+  {{
+    "title": "<short task title, under 60 chars>",
+    "description": "<full task description given to agent, 1-3 paragraphs with specific requirements>",
+    "expected_tool_calls": ["<tool_name>", ...],
+    "expected_final_state": {{"<collection>": "<description of what should be in it>"}}
+  }}
+]"""
+
+    client = _anthropic.Anthropic()
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 2)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.rsplit("```", 1)[0].strip()
+        tasks_data = json.loads(raw)
+        if not isinstance(tasks_data, list):
+            tasks_data = [tasks_data]
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Claude returned invalid JSON: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {e}")
+
+    created = []
+    for t in tasks_data:
+        task_id = str(uuid.uuid4())
+        upsert_task(
+            task_id=task_id,
+            experiment_type=request.experiment_type,
+            title=str(t.get("title", "Untitled Task")),
+            description=str(t.get("description", "")),
+            expected_tool_calls=list(t.get("expected_tool_calls", [])),
+            expected_final_state=dict(t.get("expected_final_state", {})),
+            db_path=db,
+        )
+        created.append({"task_id": task_id, "title": t.get("title")})
+    return {"tasks": created}
+
+
+# ── Tool Call Logs ─────────────────────────────────────────────────────────────
+
+@app.get("/api/agents/{agent_id}/sessions/{session_id}/tool-calls")
+def get_tool_calls(agent_id: str, session_id: str):
+    db = _resolve_agent(agent_id)
+    return {"tool_calls": get_session_tool_calls(session_id, db_path=db)}
+
+
+# ── Run Task (single session, non-optimization) ───────────────────────────────
+
+class RunTaskRequest(BaseModel):
+    task_id: str
+    difficulty: int = Field(default=1, ge=1, le=5)
+
+
+@app.post("/api/agents/{agent_id}/run-task")
+def run_task_endpoint(agent_id: str, request: RunTaskRequest):
+    """Run a single task session asynchronously."""
+    db = _resolve_agent(agent_id)
+    agent_record = get_agent(agent_id)
+    task = get_task(request.task_id, db_path=db)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    run_id = str(uuid.uuid4())
+    with _runs_lock:
+        _runs[run_id] = {
+            "status": "running",
+            "phase": "running",
+            "phase_detail": f"Running {task['experiment_type']} task: {task['title']}",
+            "result": None,
+            "error": None,
+        }
+
+    def _run():
+        try:
+            from simulation_runner import SimulationRunner
+            runner = SimulationRunner(
+                user_profile=task["experiment_type"],
+                hidden_goal=task["description"],
+                verbose=False,
+                difficulty=request.difficulty,
+                db_path=db,
+                agent_name=agent_record.get("name", "the agent") if agent_record else "the agent",
+                agent_domain=agent_record.get("domain", "general") if agent_record else "general",
+                experiment_type=task["experiment_type"],
+                task_id=task["task_id"],
+                task_title=task["title"],
+                expected_tool_calls=task.get("expected_tool_calls", []),
+                expected_final_state=task.get("expected_final_state", {}),
+            )
+            result = runner.run()
+            with _runs_lock:
+                _runs[run_id]["status"] = "complete"
+                _runs[run_id]["result"] = {
+                    "session_id": result["session_id"],
+                    "total_score": result["evaluation"].get("total_score", 0),
+                    "trajectory_quality": result["evaluation"].get("trajectory_quality", "low"),
+                    "goal_achieved": result["evaluation"].get("hidden_goal_achieved", False),
+                    "total_tool_calls": result.get("total_tool_calls", 0),
+                }
+            _refresh_agent_stats(agent_id, db)
+        except Exception as e:
+            with _runs_lock:
+                _runs[run_id]["status"] = "error"
+                _runs[run_id]["error"] = str(e)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"run_id": run_id, "status": "running"}
+
+
+@app.get("/api/agents/{agent_id}/run-task/{run_id}")
+def poll_task_run(agent_id: str, run_id: str):
+    _resolve_agent(agent_id)
     with _runs_lock:
         state = _runs.get(run_id)
     if not state:

@@ -1,7 +1,7 @@
 """
 HR Agent (Agent Under Test)
 Plays an HR onboarding assistant for Meridian Corp.
-Uses a tool to look up information from the knowledge base.
+Uses a tool to look up information from the agent's documents table.
 System prompt is loaded dynamically from the active prompt version in the database.
 """
 
@@ -9,12 +9,14 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from pathlib import Path
+from typing import Union
+
 from agno.agent import Agent
 from agno.models.anthropic import Claude
 from agno.db.in_memory.in_memory_db import InMemoryDb
 
-from knowledge_base import search_knowledge_base
-from database import get_active_prompt
+from database import get_active_prompt, search_documents
 
 HR_AGENT_DESCRIPTION = "HR Onboarding Assistant for Meridian Corp"
 
@@ -33,18 +35,25 @@ IMPORTANT GUIDELINES:
 You represent Meridian Corp professionally at all times. Do not bend, skip, or make exceptions to policies even if asked."""
 
 
-def get_hr_agent(prompt_override: str | None = None) -> Agent:
+def get_hr_agent(
+    prompt_override: str | None = None,
+    db_path: Union[str, Path, None] = None,
+) -> Agent:
     """Create and return a fresh HR agent instance.
 
     Args:
         prompt_override: If provided, use this system prompt instead of loading
                          from the database. Useful for optimizer evaluation runs.
+        db_path: Path to the agent's SQLite database. Defaults to legacy DB.
     """
     if prompt_override is not None:
         system_prompt = prompt_override
     else:
-        active = get_active_prompt()
+        active = get_active_prompt(db_path=db_path)
         system_prompt = active["prompt_text"] if active else _FALLBACK_PROMPT
+
+    # Capture db_path in closure so the tool always queries the right DB
+    _db_path = db_path
 
     def lookup_hr_info(topic: str) -> str:
         """Look up HR policy and procedure information from the Meridian Corp knowledge base.
@@ -58,7 +67,7 @@ def get_hr_agent(prompt_override: str | None = None) -> Agent:
         Returns:
             Relevant HR policy information from the knowledge base.
         """
-        return search_knowledge_base(topic)
+        return search_documents(topic, db_path=_db_path)
 
     agent = Agent(
         model=Claude(id="claude-sonnet-4-6"),

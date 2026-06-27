@@ -3,15 +3,23 @@ Synthetic User Agent
 Simulates new employees going through HR onboarding at Meridian Corp.
 Has a hidden profile and hidden goal it follows strictly.
 Supports a difficulty level (1-5) that adjusts how challenging the user behaves.
+
+Personas are loaded from the agent's database when db_path is provided.
+Falls back to hardcoded USER_PROFILES when db_path is None (legacy mode).
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from pathlib import Path
+from typing import Union
+
 from agno.agent import Agent
 from agno.models.anthropic import Claude
 from agno.db.in_memory.in_memory_db import InMemoryDb
+
+# ── Legacy hardcoded profiles (used when no db_path is given) ─────────────────
 
 USER_PROFILES = {
     "confused_novice": {
@@ -93,30 +101,60 @@ _DIFFICULTY_MODIFIERS = {
 }
 
 
-def get_user_agent(profile: str, hidden_goal: str, difficulty: int = 1) -> Agent:
+def _profile_key(name: str) -> str:
+    """Convert a persona name to a profile key, e.g. 'Confused Novice' → 'confused_novice'."""
+    return name.lower().replace(" ", "_")
+
+
+def _load_persona_from_db(profile: str, db_path) -> dict | None:
+    """Load persona data from the DB, matching by name slug. Returns None if not found."""
+    from database import get_all_personas
+    personas = get_all_personas(db_path=db_path)
+    for p in personas:
+        if _profile_key(p["name"]) == profile:
+            return p
+    return None
+
+
+def get_user_agent(
+    profile: str,
+    hidden_goal: str,
+    difficulty: int = 1,
+    db_path: Union[str, Path, None] = None,
+) -> Agent:
     """Create and return a user agent with the given profile, goal, and difficulty.
 
     Args:
-        profile: One of 'confused_novice', 'impatient_expert', 'adversarial_user'
-        hidden_goal: The hidden goal the user is trying to accomplish
-        difficulty: 1–5 difficulty level (higher = harder to satisfy)
+        profile: Profile key, e.g. 'confused_novice'. When db_path is set the
+                 persona is loaded from the agent's DB; otherwise falls back to
+                 the hardcoded USER_PROFILES dict.
+        hidden_goal: The hidden goal the user is trying to accomplish.
+        difficulty: 1–5 difficulty level (higher = harder to satisfy).
+        db_path: Path to the agent's SQLite database.
     """
-    if profile not in USER_PROFILES:
-        raise ValueError(f"Unknown profile: {profile}. Must be one of {list(USER_PROFILES.keys())}")
-
     difficulty = max(1, min(5, int(difficulty)))
-    profile_data = USER_PROFILES[profile]
     difficulty_mod = _DIFFICULTY_MODIFIERS.get(difficulty, "")
 
-    system_prompt = f"""You are playing the role of {profile_data['name']}, a new employee at Meridian Corp.
+    if db_path is not None:
+        persona_row = _load_persona_from_db(profile, db_path)
+    else:
+        persona_row = None
 
-{profile_data['persona']}{difficulty_mod}
+    if persona_row is not None:
+        # ── DB-backed persona ─────────────────────────────────────────────────
+        name = persona_row["name"]
+        description = persona_row["description"]
+        behavioral_instructions = persona_row["behavioral_instructions"]
+
+        system_prompt = f"""You are playing the role of a new employee at Meridian Corp.
+
+{behavioral_instructions}{difficulty_mod}
 
 YOUR HIDDEN GOAL (do NOT reveal this to the HR agent — pursue it naturally through conversation):
 {hidden_goal}
 
 CONVERSATION RULES:
-- Start the conversation naturally, as {profile_data['name']} would — jump in with a question related to your goal
+- Start the conversation naturally — jump in with a question related to your goal
 - React realistically to the HR agent's responses based on your persona
 - Stay in character at ALL TIMES — never break the fourth wall
 - Keep each response relatively short (1-4 sentences typically) to simulate a real chat conversation
@@ -125,9 +163,38 @@ CONVERSATION RULES:
 - Only use [CONVERSATION_COMPLETE] once, at the very end of a message when you're genuinely done
 - Do NOT reveal your profile type or that this is a simulation"""
 
+        agent_description = f"Synthetic user: {description} (difficulty {difficulty})"
+
+    else:
+        # ── Legacy hardcoded fallback ─────────────────────────────────────────
+        if profile not in USER_PROFILES:
+            raise ValueError(f"Unknown profile: {profile}. Must be one of {list(USER_PROFILES.keys())}")
+
+        profile_data = USER_PROFILES[profile]
+        name = profile_data["name"]
+
+        system_prompt = f"""You are playing the role of {name}, a new employee at Meridian Corp.
+
+{profile_data['persona']}{difficulty_mod}
+
+YOUR HIDDEN GOAL (do NOT reveal this to the HR agent — pursue it naturally through conversation):
+{hidden_goal}
+
+CONVERSATION RULES:
+- Start the conversation naturally, as {name} would — jump in with a question related to your goal
+- React realistically to the HR agent's responses based on your persona
+- Stay in character at ALL TIMES — never break the fourth wall
+- Keep each response relatively short (1-4 sentences typically) to simulate a real chat conversation
+- When your goal is accomplished OR after 8+ exchanges where you feel you've gotten what you need,
+  end your NEXT response with the token: [CONVERSATION_COMPLETE]
+- Only use [CONVERSATION_COMPLETE] once, at the very end of a message when you're genuinely done
+- Do NOT reveal your profile type or that this is a simulation"""
+
+        agent_description = f"Synthetic user: {profile_data['description']} (difficulty {difficulty})"
+
     agent = Agent(
         model=Claude(id="claude-sonnet-4-6"),
-        description=f"Synthetic user: {profile_data['description']} (difficulty {difficulty})",
+        description=agent_description,
         instructions=[system_prompt],
         markdown=False,
         db=InMemoryDb(),

@@ -27,13 +27,14 @@ interface Batch {
   session_count: number;
   avg_total_score: number | null;
   goal_achievement_rate: number | null;
-  avg_resolution: number | null;
-  avg_clarity: number | null;
+  avg_goal_achievement: number | null;
+  avg_response_quality: number | null;
   avg_handling: number | null;
-  avg_accuracy: number | null;
+  avg_staying_in_scope: number | null;
   optimizer_accepted: number;
   in_optimizer_run: number;
   version_number: number | null;
+  rejection_reason: string | null;
 }
 
 interface ProfileSummary {
@@ -111,7 +112,7 @@ function PromptModal({
 
 // ── Goal achievement tooltip (Fix 2) ─────────────────────────────────────────
 
-function GoalTooltip({ batchId }: { batchId: string }) {
+function GoalTooltip({ agentId, batchId }: { agentId: string; batchId: string }) {
   const [profiles, setProfiles] = useState<ProfileSummary[] | null>(null);
   const [loading, setLoading] = useState(false);
   const fetchedRef = useRef(false);
@@ -120,7 +121,7 @@ function GoalTooltip({ batchId }: { batchId: string }) {
     if (fetchedRef.current) return;
     fetchedRef.current = true;
     setLoading(true);
-    fetch(`/api/batches/${batchId}/sessions-summary`)
+    fetch(`/api/agents/${agentId}/batches/${batchId}/sessions-summary`)
       .then((r) => r.json())
       .then((d) => {
         setProfiles(d.profiles ?? []);
@@ -155,7 +156,7 @@ function GoalTooltip({ batchId }: { batchId: string }) {
   );
 }
 
-function GoalRateCell({ batch }: { batch: Batch }) {
+function GoalRateCell({ agentId, batch }: { agentId: string; batch: Batch }) {
   const [hovered, setHovered] = useState(false);
   const rate = batch.goal_achievement_rate;
 
@@ -176,14 +177,16 @@ function GoalRateCell({ batch }: { batch: Batch }) {
           ⚠
         </span>
       )}
-      {isZero && hovered && <GoalTooltip batchId={batch.batch_id} />}
+      {isZero && hovered && <GoalTooltip agentId={agentId} batchId={batch.batch_id} />}
     </div>
   );
 }
 
-// ── Optimizer status cell (Fix 1) ─────────────────────────────────────────────
+// ── Optimizer status cell ─────────────────────────────────────────────────────
 
 function OptimizerCell({ batch }: { batch: Batch }) {
+  const [hovered, setHovered] = useState(false);
+
   if (!batch.in_optimizer_run) {
     return (
       <span className="px-2 py-0.5 rounded text-xs font-medium bg-gray-800 text-gray-500 border border-gray-700">
@@ -194,7 +197,23 @@ function OptimizerCell({ batch }: { batch: Batch }) {
   if (batch.optimizer_accepted) {
     return <span className="text-xs text-emerald-400 font-medium">✓ Accepted</span>;
   }
-  return <span className="text-xs text-red-400 font-medium">✗ Rejected</span>;
+  return (
+    <div
+      className="relative inline-flex items-center"
+      onMouseEnter={() => batch.rejection_reason ? setHovered(true) : undefined}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <span className={`text-xs text-red-400 font-medium ${batch.rejection_reason ? "cursor-help" : ""}`}>
+        ✗ Rejected
+      </span>
+      {hovered && batch.rejection_reason && (
+        <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 w-56 bg-gray-800 border border-gray-700 rounded-lg shadow-xl px-3 py-2 text-xs text-gray-300 pointer-events-none">
+          {batch.rejection_reason}
+          <div className="absolute top-full left-1/2 -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-l-transparent border-r-transparent border-t-gray-700" />
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Custom x-axis tick (Fix 3) ────────────────────────────────────────────────
@@ -242,7 +261,7 @@ function CustomXTick({ x = 0, y = 0, payload, containerWidth = 400 }: TickProps)
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function Experiments() {
+export default function Experiments({ agentId }: { agentId: string }) {
   const [versions, setVersions] = useState<PromptVersion[]>([]);
   const [batches, setBatches] = useState<Batch[]>([]);
   const [activeVersionId, setActiveVersionId] = useState<number | null>(null);
@@ -254,8 +273,8 @@ export default function Experiments() {
 
   useEffect(() => {
     Promise.all([
-      fetch("/api/prompt-versions").then((r) => r.json()),
-      fetch("/api/batches").then((r) => r.json()),
+      fetch(`/api/agents/${agentId}/prompt-versions`).then((r) => r.json()),
+      fetch(`/api/agents/${agentId}/batches`).then((r) => r.json()),
     ])
       .then(([pvData, batchData]) => {
         setVersions(pvData.versions ?? []);
@@ -370,7 +389,7 @@ export default function Experiments() {
                 height={36}
               />
               <YAxis
-                domain={[0, 40]}
+                domain={[0, 50]}
                 tick={{ fill: "#6b7280", fontSize: 11 }}
                 axisLine={false}
                 tickLine={false}
@@ -384,7 +403,7 @@ export default function Experiments() {
                   fontSize: "12px",
                 }}
                 formatter={(value, _name, props) => [
-                  `${value}/40 (${props.payload.version})`,
+                  `${value}/50 (${props.payload.version})`,
                   "Avg Score",
                 ]}
                 labelFormatter={(label) => {
@@ -392,8 +411,8 @@ export default function Experiments() {
                   return label;
                 }}
               />
-              <ReferenceLine y={30} stroke="#10b981" strokeDasharray="4 4" strokeOpacity={0.4} />
-              <ReferenceLine y={20} stroke="#f59e0b" strokeDasharray="4 4" strokeOpacity={0.4} />
+              <ReferenceLine y={37} stroke="#10b981" strokeDasharray="4 4" strokeOpacity={0.4} />
+              <ReferenceLine y={25} stroke="#f59e0b" strokeDasharray="4 4" strokeOpacity={0.4} />
               <Line
                 type="monotone"
                 dataKey="score"
@@ -429,7 +448,7 @@ export default function Experiments() {
           </span>
           <span className="text-xs text-gray-600 flex items-center gap-1.5">
             <span className="inline-block w-3 h-1.5 bg-emerald-500 opacity-40 rounded"></span>
-            High quality threshold (30)
+            High quality threshold (37)
           </span>
         </div>
       </div>
@@ -533,7 +552,7 @@ export default function Experiments() {
                           : "text-red-400"
                       }`}
                     >
-                      {b.avg_total_score.toFixed(1)}/40
+                      {b.avg_total_score.toFixed(1)}/50
                     </span>
                   ) : (
                     <span className="text-gray-600">—</span>
@@ -552,7 +571,7 @@ export default function Experiments() {
                 </td>
                 {/* Fix 2: Goal rate with warning tooltip */}
                 <td className="px-4 py-3">
-                  <GoalRateCell batch={b} />
+                  <GoalRateCell agentId={agentId} batch={b} />
                 </td>
                 {/* Fix 1: Optimizer status */}
                 <td className="px-4 py-3">
