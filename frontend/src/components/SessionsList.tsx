@@ -10,6 +10,7 @@ interface Session {
   trajectory_quality: string | null;
   difficulty: number | null;
   experiment_type: string | null;
+  batch_role: string | null;
 }
 
 interface Task {
@@ -17,6 +18,46 @@ interface Task {
   title: string;
   description: string;
   experiment_type: string;
+}
+
+interface Persona {
+  persona_id: string;
+  name: string;
+  hidden_goals: string[];
+  behavioral_instructions: string;
+  difficulty_base: number;
+}
+
+interface PollState {
+  status: "running" | "complete" | "error";
+  phase: "primary" | "generating_challenger" | "challenger";
+  current_run: number;
+  total_runs: number;
+  persona_name: string | null;
+  persona_run: number | null;
+  persona_runs_total: number | null;
+  cancel_requested: boolean;
+  stopped_early: boolean;
+  primary_complete: boolean;
+  primary_avg: number | null;
+  primary_goal_rate: number | null;
+  primary_quality_counts: Record<string, number> | null;
+  challenger_prompt_text: string | null;
+  result: BatchResult | null;
+  error: string | null;
+}
+
+interface BatchResult {
+  total_runs: number;
+  quality_counts: Record<string, number>;
+  primary_avg: number;
+  primary_goal_rate?: number;
+  challenger_avg?: number;
+  challenger_goal_rate?: number;
+  delta?: number;
+  decision?: "challenger_wins" | "challenger_loses" | "rejected_zero_goals";
+  challenger_prompt_text?: string;
+  optimizer_enabled: boolean;
 }
 
 const PROFILE_BADGE: Record<string, { label: string; classes: string }> = {
@@ -107,6 +148,14 @@ function DifficultyBadge({ difficulty }: { difficulty: number | null }) {
   );
 }
 
+function ChallengerPill() {
+  return (
+    <span className="px-2 py-0.5 rounded text-xs font-medium bg-purple-900/60 text-purple-300 border border-purple-700">
+      Challenger
+    </span>
+  );
+}
+
 function formatTs(ts: string) {
   try {
     return new Date(ts + "Z").toLocaleString();
@@ -119,38 +168,306 @@ type QualityFilter = "all" | "high" | "medium" | "low";
 
 // ── Run Simulation Modal ──────────────────────────────────────────────────────
 
-const PHASE_STEPS = [
-  { key: "eval",       label: "Run eval batch",       desc: "Scoring current prompt" },
-  { key: "propose",    label: "Rewrite prompt",        desc: "Meta-agent proposes changes" },
-  { key: "challenger", label: "Run challenger batch",  desc: "Scoring new prompt" },
-  { key: "decision",   label: "Compare & decide",      desc: "Keep or revert" },
-];
-
-const SESSION_COUNT_OPTIONS = [3, 6, 9, 12];
-const RUN_COUNT_OPTIONS: Array<1 | 3 | 5> = [1, 3, 5];
-
-interface RunResult {
-  eval_avg: number;
-  challenger_avg: number;
-  improvement: number;
-  accepted: boolean;
-  change_summary: string;
-  decision: string;
-}
-
-interface TaskRunResult {
-  session_id: string;
-  total_score: number;
-  trajectory_quality: string;
-  goal_achieved: boolean;
-  total_tool_calls: number;
-}
+const TASK_PRESETS = [1, 3, 5, 10];
 
 const EXPERIMENT_TYPE_OPTIONS = [
   { value: "conversation", label: "Conversation", desc: "Multi-turn dialogue optimization" },
   { value: "single_output", label: "Single Output", desc: "One-shot task completion" },
   { value: "multi_step", label: "Multi-Step", desc: "Complex multi-tool task" },
 ];
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function Spinner({ cls = "w-4 h-4" }: { cls?: string }) {
+  return (
+    <svg className={`animate-spin ${cls} text-indigo-400`} fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+    </svg>
+  );
+}
+
+function OptimizerSection({
+  enabled, onToggle, mode, onModeChange, focus, onFocusChange,
+  challengerText, onChallengerTextChange, activePromptText,
+}: {
+  enabled: boolean;
+  onToggle: () => void;
+  mode: "auto" | "manual";
+  onModeChange: (m: "auto" | "manual") => void;
+  focus: string;
+  onFocusChange: (s: string) => void;
+  challengerText: string;
+  onChallengerTextChange: (s: string) => void;
+  activePromptText: string;
+}) {
+  return (
+    <div className="border-t border-gray-800 pt-4">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs font-medium text-gray-300">Prompt Optimization</span>
+        <button
+          onClick={onToggle}
+          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+            enabled ? "bg-indigo-600" : "bg-gray-700"
+          }`}
+        >
+          <span
+            className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+              enabled ? "translate-x-[18px]" : "translate-x-0.5"
+            }`}
+          />
+        </button>
+      </div>
+      <p className="text-gray-600 text-xs mb-3">Test a challenger prompt after this batch</p>
+
+      {enabled && (
+        <div className="space-y-3 bg-gray-950 rounded-lg p-3 border border-gray-800">
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="radio"
+              name="optimizer-mode"
+              value="auto"
+              checked={mode === "auto"}
+              onChange={() => onModeChange("auto")}
+              className="mt-0.5 accent-indigo-500 shrink-0"
+            />
+            <div className="flex-1 min-w-0">
+              <span className="text-xs text-gray-300 font-medium">Auto-generate challenger prompt</span>
+              {mode === "auto" && (
+                <input
+                  type="text"
+                  value={focus}
+                  onChange={e => onFocusChange(e.target.value)}
+                  placeholder="Focus area (optional) — e.g. reduce fabrication, improve tone"
+                  className="mt-1.5 w-full bg-gray-800 border border-gray-700 text-white text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:border-indigo-500"
+                />
+              )}
+            </div>
+          </label>
+
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              type="radio"
+              name="optimizer-mode"
+              value="manual"
+              checked={mode === "manual"}
+              onChange={() => {
+                onModeChange("manual");
+                if (!challengerText && activePromptText) onChallengerTextChange(activePromptText);
+              }}
+              className="mt-0.5 accent-indigo-500 shrink-0"
+            />
+            <div className="flex-1 min-w-0">
+              <span className="text-xs text-gray-300 font-medium">Write my own challenger prompt</span>
+              {mode === "manual" && (
+                <textarea
+                  value={challengerText}
+                  onChange={e => onChallengerTextChange(e.target.value)}
+                  rows={6}
+                  className="mt-1.5 w-full bg-gray-800 border border-gray-700 text-gray-200 text-xs font-mono rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500 resize-y"
+                  placeholder="Enter challenger system prompt…"
+                />
+              )}
+            </div>
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BatchProgressDisplay({
+  pollState, isConversation, stopRequested, onStop,
+}: {
+  pollState: PollState | null;
+  isConversation: boolean;
+  stopRequested: boolean;
+  onStop: () => void;
+}) {
+  const phase = pollState?.phase ?? "primary";
+  const currentRun = pollState?.current_run ?? 0;
+  const totalRuns = pollState?.total_runs ?? 0;
+  const personaName = pollState?.persona_name;
+  const personaRun = pollState?.persona_run;
+  const personaRunsTotal = pollState?.persona_runs_total;
+  const primaryAvg = pollState?.primary_avg;
+  const progress = totalRuns > 0 ? (currentRun / totalRuns) * 100 : 0;
+
+  if (phase === "generating_challenger") {
+    return (
+      <div className="py-6 flex flex-col items-center gap-4">
+        {primaryAvg != null && (
+          <div className="rounded-lg bg-gray-800 px-4 py-2 text-center">
+            <p className="text-xs text-gray-400 mb-0.5">Primary batch complete</p>
+            <p className="text-white font-semibold">Avg: {primaryAvg.toFixed(1)}/50</p>
+          </div>
+        )}
+        <div className="flex items-center gap-2 text-gray-400">
+          <Spinner />
+          <span className="text-sm">Generating challenger prompt…</span>
+        </div>
+      </div>
+    );
+  }
+
+  const phaseLabel = phase === "challenger" ? "Challenger batch" : "Primary batch";
+
+  return (
+    <div className="py-2 space-y-4">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-gray-400">{phaseLabel}</span>
+        {phase === "challenger" && primaryAvg != null && (
+          <span className="text-xs text-gray-500">Primary avg: {primaryAvg.toFixed(1)}/50</span>
+        )}
+      </div>
+
+      <div>
+        <div className="flex justify-between text-xs text-gray-400 mb-1.5">
+          <span>Running simulation {currentRun} of {totalRuns}</span>
+          <span>{Math.round(progress)}%</span>
+        </div>
+        <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-indigo-500 rounded-full transition-all duration-500"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+      </div>
+
+      {isConversation && personaName && (
+        <div className="flex items-center gap-2">
+          <Spinner cls="w-3.5 h-3.5" />
+          <p className="text-xs text-gray-300">
+            Persona: <span className="text-white">{personaName}</span>
+            {personaRun != null && personaRunsTotal != null && (
+              <span className="text-gray-500"> — Run {personaRun} of {personaRunsTotal}</span>
+            )}
+          </p>
+        </div>
+      )}
+
+      {phase === "primary" && (
+        <button
+          onClick={onStop}
+          disabled={stopRequested}
+          className="w-full py-1.5 rounded-lg bg-gray-800 text-gray-400 hover:text-white text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {stopRequested ? "Stopping after current run…" : "Stop after current run"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function BatchResultDisplay({
+  result, savedChallenger, savingChallenger, onAccept, onDecline,
+}: {
+  result: BatchResult;
+  savedChallenger: boolean;
+  savingChallenger: boolean;
+  onAccept: () => void;
+  onDecline: () => void;
+}) {
+  const { total_runs, quality_counts, optimizer_enabled, primary_avg, challenger_avg, delta, decision } = result;
+
+  if (!optimizer_enabled) {
+    return (
+      <div className="py-8 text-center">
+        <div className="w-12 h-12 rounded-full bg-emerald-900/40 border border-emerald-700 flex items-center justify-center mx-auto mb-4">
+          <span className="text-emerald-400 text-xl">✓</span>
+        </div>
+        <p className="text-white font-medium mb-1">
+          {total_runs} simulation{total_runs !== 1 ? "s" : ""} complete
+        </p>
+        <p className="text-gray-500 text-sm">
+          {quality_counts?.high ?? 0} High / {quality_counts?.medium ?? 0} Medium / {quality_counts?.low ?? 0} Low quality
+        </p>
+        <p className="text-gray-600 text-xs mt-3">Closing in 3 seconds…</p>
+      </div>
+    );
+  }
+
+  if (savedChallenger) {
+    return (
+      <div className="py-8 text-center">
+        <div className="w-12 h-12 rounded-full bg-emerald-900/40 border border-emerald-700 flex items-center justify-center mx-auto mb-4">
+          <span className="text-emerald-400 text-xl">✓</span>
+        </div>
+        <p className="text-white font-medium">New prompt version saved and activated</p>
+        <p className="text-gray-500 text-xs mt-1">Closing…</p>
+      </div>
+    );
+  }
+
+  if (decision === "challenger_wins") {
+    return (
+      <div className="py-2">
+        <div className="rounded-lg p-4 mb-4 bg-emerald-900/20 border border-emerald-800">
+          <p className="text-emerald-400 text-sm font-semibold mb-0.5">
+            Challenger prompt wins (+{delta?.toFixed(1)} pts)
+          </p>
+          <p className="text-gray-400 text-xs">Save as new active version?</p>
+        </div>
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          <div className="bg-gray-800 rounded-lg p-3 text-center">
+            <p className="text-gray-500 text-xs mb-1">Primary avg</p>
+            <p className="text-white font-semibold">{primary_avg?.toFixed(1)}/50</p>
+          </div>
+          <div className="bg-gray-800 rounded-lg p-3 text-center">
+            <p className="text-gray-500 text-xs mb-1">Challenger avg</p>
+            <p className="text-emerald-400 font-semibold">{challenger_avg?.toFixed(1)}/50</p>
+          </div>
+          <div className="bg-gray-800 rounded-lg p-3 text-center">
+            <p className="text-gray-500 text-xs mb-1">Quality</p>
+            <p className="text-gray-300 text-xs">
+              {quality_counts?.high ?? 0}H {quality_counts?.medium ?? 0}M {quality_counts?.low ?? 0}L
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-3">
+          <button
+            onClick={onDecline}
+            className="flex-1 py-2 rounded-lg bg-gray-800 text-gray-400 hover:text-white text-sm transition-colors"
+          >
+            No, keep current
+          </button>
+          <button
+            onClick={onAccept}
+            disabled={savingChallenger}
+            className="flex-1 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium transition-colors disabled:opacity-50"
+          >
+            {savingChallenger ? "Saving…" : "Yes, save"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const msg =
+    decision === "rejected_zero_goals"
+      ? "Challenger rejected — 0% goal achievement rate."
+      : `Challenger did not improve (${delta?.toFixed(1)} pts). Keeping current prompt.`;
+
+  return (
+    <div className="py-8 text-center">
+      <div className="w-12 h-12 rounded-full bg-yellow-900/40 border border-yellow-700 flex items-center justify-center mx-auto mb-4">
+        <span className="text-yellow-400 text-xl">↩</span>
+      </div>
+      <p className="text-white font-medium mb-3">{msg}</p>
+      <div className="grid grid-cols-2 gap-3 max-w-xs mx-auto">
+        <div className="bg-gray-800 rounded-lg p-3 text-center">
+          <p className="text-gray-500 text-xs mb-1">Primary</p>
+          <p className="text-white font-semibold">{primary_avg?.toFixed(1)}/50</p>
+        </div>
+        <div className="bg-gray-800 rounded-lg p-3 text-center">
+          <p className="text-gray-500 text-xs mb-1">Challenger</p>
+          <p className="text-red-400 font-semibold">{challenger_avg?.toFixed(1)}/50</p>
+        </div>
+      </div>
+      <p className="text-gray-600 text-xs mt-4">Closing in 3 seconds…</p>
+    </div>
+  );
+}
 
 function RunSimulationModal({
   agentId,
@@ -161,190 +478,218 @@ function RunSimulationModal({
   onClose: () => void;
   onComplete: () => void;
 }) {
+  // ── Config ────────────────────────────────────────────────────────
   const [experimentType, setExperimentType] = useState("conversation");
-  const [sessionCount, setSessionCount] = useState(3);
-  const [difficulty, setDifficulty] = useState(1);
+  const [personas, setPersonas] = useState<Persona[]>([]);
+  const [personasLoading, setPersonasLoading] = useState(false);
+  const [activePromptText, setActivePromptText] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [selectedTaskId, setSelectedTaskId] = useState<string>("");
   const [tasksLoading, setTasksLoading] = useState(false);
-  const [runCount, setRunCount] = useState<1 | 3 | 5>(1);
-  const [multiRunProgress, setMultiRunProgress] = useState<{ current: number; total: number } | null>(null);
+  const [selectedTaskId, setSelectedTaskId] = useState<string>("");
+  const [difficulty, setDifficulty] = useState(1);
 
+  // ── Run count ─────────────────────────────────────────────────────
+  const [convPreset, setConvPreset] = useState<number | "custom">(0);
+  const [convCustom, setConvCustom] = useState("");
+  const [taskPreset, setTaskPreset] = useState<number | "custom">(1);
+  const [taskCustom, setTaskCustom] = useState("");
+
+  // ── Optimizer ─────────────────────────────────────────────────────
+  const [optimizerEnabled, setOptimizerEnabled] = useState(false);
+  const [optimizerMode, setOptimizerMode] = useState<"auto" | "manual">("auto");
+  const [optimizerFocus, setOptimizerFocus] = useState("");
+  const [challengerPromptEdit, setChallengerPromptEdit] = useState("");
+
+  // ── Run state ─────────────────────────────────────────────────────
   const [status, setStatus] = useState<"idle" | "running" | "done" | "error">("idle");
-  const [currentPhase, setCurrentPhase] = useState<string>("eval");
-  const [phaseDetail, setPhaseDetail] = useState<string>("");
-  const [result, setResult] = useState<RunResult | null>(null);
-  const [taskResult, setTaskResult] = useState<TaskRunResult | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
+  const [stopRequested, setStopRequested] = useState(false);
+  const [pollState, setPollState] = useState<PollState | null>(null);
+  const [completionResult, setCompletionResult] = useState<BatchResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [savingChallenger, setSavingChallenger] = useState(false);
+  const [savedChallenger, setSavedChallenger] = useState(false);
 
   const difficultyLabels = ["", "Easy", "Moderate", "Hard", "Very Hard", "Extreme"];
   const isConversation = experimentType === "conversation";
+  const k = personas.length;
+  const filteredTasks = tasks.filter(t => t.experiment_type === experimentType);
 
-  // Derived: tasks filtered to match selected experiment type
-  const filteredTasks = tasks.filter((t) => t.experiment_type === experimentType);
+  const convPresetOptions = k > 0 ? [
+    { value: k, label: String(k), sub: "1 round" },
+    { value: k * 3, label: String(k * 3), sub: "3 rounds" },
+    { value: k * 5, label: String(k * 5), sub: "5 rounds" },
+    { value: k * 10, label: String(k * 10), sub: "10 rounds" },
+  ] : [];
 
-  // Load all tasks once on mount
+  const actualConvRuns = convPreset === "custom" ? (parseInt(convCustom) || 0) : (convPreset as number);
+  const convCustomIsValid = convPreset !== "custom" || (parseInt(convCustom) > 0 && k > 0 && parseInt(convCustom) % k === 0);
+  const actualTaskRuns = taskPreset === "custom" ? (parseInt(taskCustom) || 0) : (taskPreset as number);
+  const totalRuns = isConversation ? actualConvRuns : actualTaskRuns;
+
+  const canRun = status === "idle" && (
+    isConversation
+      ? k > 0 && actualConvRuns > 0 && convCustomIsValid
+      : filteredTasks.length > 0 && !!selectedTaskId && actualTaskRuns > 0
+  );
+
+  // ── Data loading ──────────────────────────────────────────────────
   useEffect(() => {
+    setPersonasLoading(true);
     setTasksLoading(true);
-    fetch(`/api/agents/${agentId}/tasks`)
-      .then((r) => r.json())
-      .then((d) => {
-        setTasks(d.tasks ?? []);
-        setTasksLoading(false);
-      })
-      .catch(() => setTasksLoading(false));
+    Promise.all([
+      fetch(`/api/agents/${agentId}/personas`).then(r => r.json()),
+      fetch(`/api/agents/${agentId}/tasks`).then(r => r.json()),
+      fetch(`/api/agents/${agentId}/config`).then(r => r.json()),
+    ]).then(([pd, td, cd]) => {
+      const p: Persona[] = pd.personas ?? [];
+      setPersonas(p);
+      setPersonasLoading(false);
+      setTasks(td.tasks ?? []);
+      setTasksLoading(false);
+      setActivePromptText(cd.active_prompt?.prompt_text ?? "");
+    }).catch(() => { setPersonasLoading(false); setTasksLoading(false); });
   }, [agentId]);
 
-  // Reset selectedTaskId when experiment type or task list changes
   useEffect(() => {
-    const filtered = tasks.filter((t) => t.experiment_type === experimentType);
+    if (personas.length > 0 && convPreset === 0) setConvPreset(personas.length);
+  }, [personas, convPreset]);
+
+  useEffect(() => {
+    const filtered = tasks.filter(t => t.experiment_type === experimentType);
     setSelectedTaskId(filtered.length > 0 ? filtered[0].task_id : "");
   }, [experimentType, tasks]);
 
-  // Auto-close 2s after multi-run completes
   useEffect(() => {
-    if (status === "done" && runCount > 1) {
-      const timer = setTimeout(() => onClose(), 2000);
-      return () => clearTimeout(timer);
+    if (optimizerEnabled && optimizerMode === "manual" && activePromptText && !challengerPromptEdit) {
+      setChallengerPromptEdit(activePromptText);
     }
-  }, [status, runCount, onClose]);
+  }, [optimizerEnabled, optimizerMode, activePromptText]);
 
-  // Inline polling helpers (avoids separate useEffect / runId state)
-  const pollConversation = async (runId: string): Promise<any> => {
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      await new Promise<void>((r) => setTimeout(r, 2000));
-      const res = await fetch(`/api/agents/${agentId}/run-simulation/${runId}`);
-      const data = await res.json();
-      setCurrentPhase(data.phase ?? "eval");
-      setPhaseDetail(data.phase_detail ?? "");
-      if (data.status === "complete") return data;
-      if (data.status === "error") throw new Error(data.error || "Run failed");
-    }
-  };
-
-  const pollTask = async (runId: string): Promise<any> => {
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      await new Promise<void>((r) => setTimeout(r, 2000));
-      const res = await fetch(`/api/agents/${agentId}/run-task/${runId}`);
-      const data = await res.json();
-      if (data.status === "complete") return data;
-      if (data.status === "error") throw new Error(data.error || "Run failed");
-    }
-  };
-
-  const startConversationRun = async () => {
-    setStatus("running");
-    setCurrentPhase("eval");
-    setPhaseDetail("");
-    setErrorMsg(null);
-    setMultiRunProgress(runCount > 1 ? { current: 1, total: runCount } : null);
-
-    for (let i = 0; i < runCount; i++) {
-      if (runCount > 1) setMultiRunProgress({ current: i + 1, total: runCount });
-      try {
-        const res = await fetch(`/api/agents/${agentId}/run-simulation`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_count: sessionCount, difficulty }),
-        });
-        if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || "Request failed");
+  // ── Polling ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!runId || status !== "running") return;
+    let active = true;
+    (async () => {
+      while (active) {
+        await new Promise(r => setTimeout(r, 1500));
+        try {
+          const res = await fetch(`/api/agents/${agentId}/run-batch-with-optimizer/${runId}`);
+          const data: PollState = await res.json();
+          if (!active) break;
+          setPollState(data);
+          if (data.status === "complete") { setCompletionResult(data.result); setStatus("done"); break; }
+          if (data.status === "error") { setErrorMsg(data.error || "Run failed"); setStatus("error"); break; }
+        } catch (e) {
+          if (active) { setErrorMsg(String(e)); setStatus("error"); }
+          break;
         }
-        const { run_id } = await res.json();
-        const pollData = await pollConversation(run_id);
-        if (i === runCount - 1) setResult(pollData.result);
-        // Reset phase display between runs
-        if (runCount > 1 && i < runCount - 1) {
-          setCurrentPhase("eval");
-          setPhaseDetail("");
-        }
-      } catch (e) {
-        setStatus("error");
-        setErrorMsg(String(e));
-        setMultiRunProgress(null);
-        return;
       }
-    }
+    })();
+    return () => { active = false; };
+  }, [runId, agentId, status]);
 
-    setMultiRunProgress(null);
-    setStatus("done");
-    onComplete();
-  };
+  // ── Auto-close when no user decision needed ───────────────────────
+  useEffect(() => {
+    if (status !== "done" || !completionResult) return;
+    const needsDecision =
+      completionResult.optimizer_enabled &&
+      completionResult.decision === "challenger_wins" &&
+      !savedChallenger;
+    if (needsDecision) return;
+    const t = setTimeout(() => { onComplete(); onClose(); }, 3000);
+    return () => clearTimeout(t);
+  }, [status, completionResult, savedChallenger]);
 
-  const startTaskRun = async () => {
-    if (!selectedTaskId) return;
+  // ── Handlers ──────────────────────────────────────────────────────
+  const handleRun = async () => {
     setStatus("running");
+    setStopRequested(false);
+    setPollState(null);
+    setCompletionResult(null);
     setErrorMsg(null);
-    setMultiRunProgress(runCount > 1 ? { current: 1, total: runCount } : null);
-
-    for (let i = 0; i < runCount; i++) {
-      if (runCount > 1) setMultiRunProgress({ current: i + 1, total: runCount });
-      try {
-        const res = await fetch(`/api/agents/${agentId}/run-task`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ task_id: selectedTaskId, experiment_type: experimentType }),
-        });
-        if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || "Request failed");
-        }
-        const { run_id } = await res.json();
-        const pollData = await pollTask(run_id);
-        if (i === runCount - 1) setTaskResult(pollData.result);
-      } catch (e) {
-        setStatus("error");
-        setErrorMsg(String(e));
-        setMultiRunProgress(null);
-        return;
-      }
-    }
-
-    setMultiRunProgress(null);
-    setStatus("done");
-    onComplete();
+    const body: Record<string, unknown> = {
+      experiment_type: experimentType,
+      total_runs: totalRuns,
+      difficulty,
+      optimizer_enabled: optimizerEnabled,
+      optimizer_mode: optimizerMode,
+      optimizer_focus: optimizerFocus,
+    };
+    if (optimizerMode === "manual") body.challenger_prompt = challengerPromptEdit;
+    if (!isConversation) body.task_id = selectedTaskId;
+    try {
+      const res = await fetch(`/api/agents/${agentId}/run-batch-with-optimizer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || "Request failed"); }
+      const { run_id } = await res.json();
+      setRunId(run_id);
+    } catch (e) { setStatus("error"); setErrorMsg(String(e)); }
   };
 
-  const currentPhaseIndex = PHASE_STEPS.findIndex((s) => s.key === currentPhase);
-  const runButtonLabel = runCount === 1 ? "Run" : `Run ${runCount} simulations`;
+  const handleStopAfterCurrent = async () => {
+    if (!runId || stopRequested) return;
+    setStopRequested(true);
+    try {
+      await fetch(`/api/agents/${agentId}/run-batch-with-optimizer/${runId}/cancel`, { method: "POST" });
+    } catch { /* ignore */ }
+  };
 
+  const handleAcceptChallenger = async () => {
+    if (!completionResult?.challenger_prompt_text) return;
+    setSavingChallenger(true);
+    try {
+      await fetch(`/api/agents/${agentId}/prompt-versions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt_text: completionResult.challenger_prompt_text,
+          change_summary: "Challenger batch winner — promoted by user",
+        }),
+      });
+      setSavedChallenger(true);
+      setTimeout(() => { onComplete(); onClose(); }, 2000);
+    } catch { setSavingChallenger(false); }
+  };
+
+  const handleDeclineChallenger = () => { onComplete(); onClose(); };
+
+  // ── Render ────────────────────────────────────────────────────────
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70"
       onClick={status === "running" ? undefined : onClose}
     >
       <div
-        className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-md w-full mx-4"
-        onClick={(e) => e.stopPropagation()}
+        className="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-lg w-full mx-4 max-h-[90vh] overflow-y-auto"
+        onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-5">
           <div>
             <h2 className="text-white font-semibold text-lg">Run Simulation</h2>
             <p className="text-gray-500 text-xs mt-0.5">
               {isConversation
-                ? "eval → rewrite → challenge → compare"
+                ? "Evaluate agent across personas"
                 : experimentType === "single_output"
                 ? "Single task evaluation"
                 : "Multi-step task evaluation"}
             </p>
           </div>
           {status !== "running" && (
-            <button onClick={onClose} className="text-gray-500 hover:text-white text-xl leading-none">
-              ×
-            </button>
+            <button onClick={onClose} className="text-gray-500 hover:text-white text-xl leading-none">×</button>
           )}
         </div>
 
+        {/* ── Idle ───────────────────────────────────────────────── */}
         {status === "idle" && (
           <>
-            {/* Experiment type selector */}
             <div className="mb-5">
               <label className="block text-xs text-gray-400 mb-2">Experiment Type</label>
               <div className="grid grid-cols-3 gap-2">
-                {EXPERIMENT_TYPE_OPTIONS.map((opt) => (
+                {EXPERIMENT_TYPE_OPTIONS.map(opt => (
                   <button
                     key={opt.value}
                     onClick={() => setExperimentType(opt.value)}
@@ -358,34 +703,75 @@ function RunSimulationModal({
                   </button>
                 ))}
               </div>
-              <p className="text-gray-600 text-xs mt-1.5">
-                {EXPERIMENT_TYPE_OPTIONS.find((o) => o.value === experimentType)?.desc}
-              </p>
             </div>
 
             {isConversation ? (
               <div className="space-y-5">
-                {/* Session count */}
+                {/* Conversation run count */}
                 <div>
-                  <label className="block text-xs text-gray-400 mb-2">Sessions per batch</label>
-                  <div className="grid grid-cols-4 gap-2">
-                    {SESSION_COUNT_OPTIONS.map((n) => (
-                      <button
-                        key={n}
-                        onClick={() => setSessionCount(n)}
-                        className={`py-2 rounded-lg text-sm font-medium transition-colors ${
-                          sessionCount === n
-                            ? "bg-indigo-600 text-white"
-                            : "bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700"
-                        }`}
-                      >
-                        {n}
-                      </button>
-                    ))}
-                  </div>
-                  <p className="text-gray-600 text-xs mt-1.5">
-                    {sessionCount} sessions × 2 batches = {sessionCount * 2} total simulations
-                  </p>
+                  <label className="block text-xs text-gray-400 mb-1">Number of runs</label>
+                  {personasLoading ? (
+                    <p className="text-gray-600 text-xs py-3">Loading personas…</p>
+                  ) : k === 0 ? (
+                    <div className="bg-gray-950 rounded-lg p-3 border border-gray-800">
+                      <p className="text-gray-400 text-xs mb-1">No personas configured</p>
+                      <p className="text-gray-600 text-xs">
+                        Add personas in the{" "}
+                        <a href={`/agents/${agentId}/edit`} className="text-indigo-400 hover:underline" onClick={onClose}>
+                          Edit page
+                        </a>{" "}
+                        to enable conversation simulations.
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-gray-600 text-xs mb-2">
+                        Must be a multiple of {k} persona{k !== 1 ? "s" : ""} — each persona runs equally
+                      </p>
+                      <div className="flex flex-wrap gap-2 mb-2">
+                        {convPresetOptions.map(opt => (
+                          <button
+                            key={opt.value}
+                            onClick={() => setConvPreset(opt.value)}
+                            className={`px-3 py-2 rounded-lg text-xs font-medium transition-colors text-center min-w-[52px] ${
+                              convPreset === opt.value
+                                ? "bg-indigo-600 text-white"
+                                : "bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700"
+                            }`}
+                          >
+                            <span className="block text-sm font-semibold">{opt.label}</span>
+                            <span className="block text-[10px] opacity-70">{opt.sub}</span>
+                          </button>
+                        ))}
+                        <button
+                          onClick={() => setConvPreset("custom")}
+                          className={`px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+                            convPreset === "custom"
+                              ? "bg-indigo-600 text-white"
+                              : "bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700"
+                          }`}
+                        >
+                          Custom
+                        </button>
+                      </div>
+                      {convPreset === "custom" && (
+                        <div>
+                          <input
+                            type="number"
+                            min={k}
+                            step={k}
+                            value={convCustom}
+                            onChange={e => setConvCustom(e.target.value)}
+                            placeholder={`e.g. ${k * 2}`}
+                            className="w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                          />
+                          {convCustom && !convCustomIsValid && (
+                            <p className="text-red-400 text-xs mt-1">Must be a multiple of {k}</p>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
 
                 {/* Difficulty */}
@@ -394,53 +780,26 @@ function RunSimulationModal({
                     Difficulty — {difficulty}: {difficultyLabels[difficulty]}
                   </label>
                   <input
-                    type="range"
-                    min={1}
-                    max={5}
-                    value={difficulty}
-                    onChange={(e) => setDifficulty(Number(e.target.value))}
+                    type="range" min={1} max={5} value={difficulty}
+                    onChange={e => setDifficulty(Number(e.target.value))}
                     className="w-full accent-indigo-500"
                   />
                   <div className="flex justify-between text-xs text-gray-600 mt-1">
-                    <span>1 Easy</span>
-                    <span>5 Extreme</span>
+                    <span>1 Easy</span><span>5 Extreme</span>
                   </div>
                 </div>
 
-                {/* Number of runs */}
-                <div>
-                  <label className="block text-xs text-gray-400 mb-2">Number of runs</label>
-                  <div className="grid grid-cols-3 gap-2">
-                    {RUN_COUNT_OPTIONS.map((n) => (
-                      <button
-                        key={n}
-                        onClick={() => setRunCount(n)}
-                        className={`py-2 rounded-lg text-sm font-medium transition-colors ${
-                          runCount === n
-                            ? "bg-indigo-600 text-white"
-                            : "bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700"
-                        }`}
-                      >
-                        {n}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Flow preview */}
-                <div className="bg-gray-950 rounded-lg p-3 border border-gray-800">
-                  <p className="text-gray-500 text-xs mb-2">Flow</p>
-                  <div className="flex items-center gap-1 flex-wrap">
-                    {PHASE_STEPS.map((s, i) => (
-                      <span key={s.key} className="flex items-center gap-1">
-                        <span className="text-xs text-gray-400">{s.label}</span>
-                        {i < PHASE_STEPS.length - 1 && (
-                          <span className="text-gray-700 text-xs">→</span>
-                        )}
-                      </span>
-                    ))}
-                  </div>
-                </div>
+                <OptimizerSection
+                  enabled={optimizerEnabled}
+                  onToggle={() => setOptimizerEnabled(v => !v)}
+                  mode={optimizerMode}
+                  onModeChange={setOptimizerMode}
+                  focus={optimizerFocus}
+                  onFocusChange={setOptimizerFocus}
+                  challengerText={challengerPromptEdit}
+                  onChallengerTextChange={setChallengerPromptEdit}
+                  activePromptText={activePromptText}
+                />
               </div>
             ) : (
               <div className="space-y-4">
@@ -451,14 +810,10 @@ function RunSimulationModal({
                     <p className="text-gray-400 text-sm mb-1">No tasks configured</p>
                     <p className="text-gray-600 text-xs">
                       Add tasks in the{" "}
-                      <a
-                        href={`/agents/${agentId}/edit`}
-                        className="text-indigo-400 hover:underline"
-                        onClick={onClose}
-                      >
+                      <a href={`/agents/${agentId}/edit`} className="text-indigo-400 hover:underline" onClick={onClose}>
                         Edit page
-                      </a>
-                      {" "}under Experiment Types & Tasks.
+                      </a>{" "}
+                      under Experiment Types &amp; Tasks.
                     </p>
                   </div>
                 ) : (
@@ -466,34 +821,29 @@ function RunSimulationModal({
                     <label className="block text-xs text-gray-400 mb-2">Select Task</label>
                     <select
                       value={selectedTaskId}
-                      onChange={(e) => setSelectedTaskId(e.target.value)}
+                      onChange={e => setSelectedTaskId(e.target.value)}
                       className="w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
                     >
-                      {filteredTasks.map((t) => (
-                        <option key={t.task_id} value={t.task_id}>
-                          {t.title}
-                        </option>
-                      ))}
+                      {filteredTasks.map(t => <option key={t.task_id} value={t.task_id}>{t.title}</option>)}
                     </select>
                     {selectedTaskId && (
                       <p className="text-gray-600 text-xs mt-1.5 truncate">
-                        {filteredTasks.find((t) => t.task_id === selectedTaskId)?.description}
+                        {filteredTasks.find(t => t.task_id === selectedTaskId)?.description}
                       </p>
                     )}
                   </div>
                 )}
 
-                {/* Number of runs — only shown when tasks are available */}
                 {filteredTasks.length > 0 && (
                   <div>
-                    <label className="block text-xs text-gray-400 mb-2">Number of runs</label>
-                    <div className="grid grid-cols-3 gap-2">
-                      {RUN_COUNT_OPTIONS.map((n) => (
+                    <label className="block text-xs text-gray-400 mb-2">Number of runs per task</label>
+                    <div className="flex flex-wrap gap-2">
+                      {TASK_PRESETS.map(n => (
                         <button
                           key={n}
-                          onClick={() => setRunCount(n)}
-                          className={`py-2 rounded-lg text-sm font-medium transition-colors ${
-                            runCount === n
+                          onClick={() => setTaskPreset(n)}
+                          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                            taskPreset === n
                               ? "bg-indigo-600 text-white"
                               : "bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700"
                           }`}
@@ -501,18 +851,41 @@ function RunSimulationModal({
                           {n}
                         </button>
                       ))}
+                      <button
+                        onClick={() => setTaskPreset("custom")}
+                        className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                          taskPreset === "custom"
+                            ? "bg-indigo-600 text-white"
+                            : "bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700"
+                        }`}
+                      >
+                        Custom
+                      </button>
                     </div>
+                    {taskPreset === "custom" && (
+                      <input
+                        type="number" min={1} value={taskCustom}
+                        onChange={e => setTaskCustom(e.target.value)}
+                        placeholder="e.g. 7"
+                        className="mt-2 w-full bg-gray-800 border border-gray-700 text-white text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                      />
+                    )}
                   </div>
                 )}
 
-                <div className="bg-gray-950 rounded-lg p-3 border border-gray-800">
-                  <p className="text-gray-500 text-xs mb-1">Flow</p>
-                  <p className="text-xs text-gray-400">
-                    {experimentType === "single_output"
-                      ? "task → single agent response → judge evaluation"
-                      : "task → tool loop → [TASK_COMPLETE] → judge evaluation"}
-                  </p>
-                </div>
+                {filteredTasks.length > 0 && (
+                  <OptimizerSection
+                    enabled={optimizerEnabled}
+                    onToggle={() => setOptimizerEnabled(v => !v)}
+                    mode={optimizerMode}
+                    onModeChange={setOptimizerMode}
+                    focus={optimizerFocus}
+                    onFocusChange={setOptimizerFocus}
+                    challengerText={challengerPromptEdit}
+                    onChallengerTextChange={setChallengerPromptEdit}
+                    activePromptText={activePromptText}
+                  />
+                )}
               </div>
             )}
 
@@ -524,261 +897,38 @@ function RunSimulationModal({
                 Cancel
               </button>
               <button
-                onClick={isConversation ? startConversationRun : startTaskRun}
-                disabled={!isConversation && (filteredTasks.length === 0 || !selectedTaskId)}
+                onClick={handleRun}
+                disabled={!canRun}
                 className="flex-1 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                {runButtonLabel}
+                Run {totalRuns > 0 ? totalRuns : "…"} simulation{totalRuns !== 1 ? "s" : ""}
               </button>
             </div>
           </>
         )}
 
-        {status === "running" && isConversation && (
-          <div className="py-2">
-            {multiRunProgress && (
-              <div className="mb-4">
-                <div className="flex justify-between text-xs text-gray-400 mb-1.5">
-                  <span>Running optimization {multiRunProgress.current} of {multiRunProgress.total}</span>
-                  <span>{multiRunProgress.current - 1}/{multiRunProgress.total} done</span>
-                </div>
-                <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-indigo-500 rounded-full transition-all duration-500"
-                    style={{ width: `${((multiRunProgress.current - 1) / multiRunProgress.total) * 100}%` }}
-                  />
-                </div>
-              </div>
-            )}
-            <div className="space-y-3 mb-5">
-              {PHASE_STEPS.map((step, i) => {
-                const isDone = i < currentPhaseIndex;
-                const isActive = i === currentPhaseIndex;
-                return (
-                  <div key={step.key} className="flex items-start gap-3">
-                    <div
-                      className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 mt-0.5 text-xs font-bold ${
-                        isDone
-                          ? "bg-emerald-600 text-white"
-                          : isActive
-                          ? "bg-indigo-600 text-white"
-                          : "bg-gray-800 text-gray-600"
-                      }`}
-                    >
-                      {isDone ? "✓" : i + 1}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p
-                        className={`text-sm font-medium ${
-                          isActive ? "text-white" : isDone ? "text-gray-400" : "text-gray-600"
-                        }`}
-                      >
-                        {step.label}
-                      </p>
-                      {isActive && phaseDetail && (
-                        <p className="text-xs text-indigo-400 mt-0.5 truncate">{phaseDetail}</p>
-                      )}
-                      {!isActive && (
-                        <p className="text-xs text-gray-700 mt-0.5">{step.desc}</p>
-                      )}
-                    </div>
-                    {isActive && (
-                      <svg className="animate-spin w-4 h-4 text-indigo-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-                      </svg>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            <p className="text-gray-600 text-xs text-center">
-              {sessionCount * 2} simulations total — this takes a few minutes
-            </p>
-          </div>
+        {/* ── Running ────────────────────────────────────────────── */}
+        {status === "running" && (
+          <BatchProgressDisplay
+            pollState={pollState}
+            isConversation={isConversation}
+            stopRequested={stopRequested}
+            onStop={handleStopAfterCurrent}
+          />
         )}
 
-        {status === "running" && !isConversation && (
-          <div className="py-6 flex flex-col items-center gap-4">
-            {multiRunProgress ? (
-              <>
-                <div className="w-full">
-                  <div className="flex justify-between text-xs text-gray-400 mb-1.5">
-                    <span>Running simulation {multiRunProgress.current} of {multiRunProgress.total}…</span>
-                    <span>{multiRunProgress.current - 1}/{multiRunProgress.total} done</span>
-                  </div>
-                  <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-indigo-500 rounded-full transition-all duration-500"
-                      style={{ width: `${((multiRunProgress.current - 1) / multiRunProgress.total) * 100}%` }}
-                    />
-                  </div>
-                </div>
-                <div className="flex items-center gap-2 text-gray-400">
-                  <svg className="animate-spin w-4 h-4 text-indigo-400" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-                  </svg>
-                  <span className="text-sm">
-                    {experimentType === "multi_step" ? "Agent is executing tool calls" : "Agent is generating response"}
-                  </span>
-                </div>
-              </>
-            ) : (
-              <>
-                <svg className="animate-spin w-8 h-8 text-indigo-400" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-                </svg>
-                <div className="text-center">
-                  <p className="text-white text-sm font-medium">Running task…</p>
-                  <p className="text-gray-500 text-xs mt-1">
-                    {experimentType === "multi_step"
-                      ? "Agent is executing tool calls"
-                      : "Agent is generating response"}
-                  </p>
-                </div>
-              </>
-            )}
-          </div>
+        {/* ── Done ───────────────────────────────────────────────── */}
+        {status === "done" && completionResult && (
+          <BatchResultDisplay
+            result={completionResult}
+            savedChallenger={savedChallenger}
+            savingChallenger={savingChallenger}
+            onAccept={handleAcceptChallenger}
+            onDecline={handleDeclineChallenger}
+          />
         )}
 
-        {/* Multi-run completion flash (auto-closes after 2s) */}
-        {status === "done" && runCount > 1 && (
-          <div className="py-8 text-center">
-            <div className="w-12 h-12 rounded-full bg-emerald-900/40 border border-emerald-700 flex items-center justify-center mx-auto mb-4">
-              <span className="text-emerald-400 text-xl">✓</span>
-            </div>
-            <p className="text-white font-medium">{runCount} simulations completed.</p>
-            <p className="text-gray-500 text-xs mt-1">Closing…</p>
-          </div>
-        )}
-
-        {/* Single conversation run result */}
-        {status === "done" && runCount === 1 && result && isConversation && (
-          <div className="py-2">
-            <div
-              className={`rounded-lg p-4 mb-4 border ${
-                result.accepted
-                  ? "bg-emerald-900/20 border-emerald-800"
-                  : "bg-yellow-900/20 border-yellow-800"
-              }`}
-            >
-              <p
-                className={`text-sm font-semibold mb-1 ${
-                  result.accepted ? "text-emerald-400" : "text-yellow-400"
-                }`}
-              >
-                {result.accepted ? "✓ New prompt kept" : "↩ Reverted to previous"}
-              </p>
-              <p className="text-gray-300 text-xs">{result.change_summary}</p>
-            </div>
-
-            <div className="grid grid-cols-3 gap-3 mb-4">
-              <div className="bg-gray-800 rounded-lg p-3 text-center">
-                <p className="text-gray-500 text-xs mb-1">Baseline</p>
-                <p className="text-white font-semibold">{result.eval_avg.toFixed(1)}</p>
-              </div>
-              <div className="bg-gray-800 rounded-lg p-3 text-center">
-                <p className="text-gray-500 text-xs mb-1">Challenger</p>
-                <p className="text-white font-semibold">{result.challenger_avg.toFixed(1)}</p>
-              </div>
-              <div className="bg-gray-800 rounded-lg p-3 text-center">
-                <p className="text-gray-500 text-xs mb-1">Delta</p>
-                <p
-                  className={`font-semibold ${
-                    result.improvement >= 0 ? "text-emerald-400" : "text-red-400"
-                  }`}
-                >
-                  {result.improvement >= 0 ? "+" : ""}
-                  {result.improvement.toFixed(1)}
-                </p>
-              </div>
-            </div>
-
-            <div className="flex gap-3">
-              <button
-                onClick={onClose}
-                className="flex-1 py-2 rounded-lg bg-gray-800 text-gray-400 hover:text-white text-sm transition-colors"
-              >
-                Close
-              </button>
-              <button
-                onClick={() => { onClose(); window.location.href = `/agents/${agentId}/experiments`; }}
-                className="flex-1 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors"
-              >
-                View Experiments
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Single task run result */}
-        {status === "done" && runCount === 1 && taskResult && !isConversation && (
-          <div className="py-2">
-            <div
-              className={`rounded-lg p-4 mb-4 border ${
-                taskResult.goal_achieved
-                  ? "bg-emerald-900/20 border-emerald-800"
-                  : "bg-red-900/20 border-red-800"
-              }`}
-            >
-              <p
-                className={`text-sm font-semibold ${
-                  taskResult.goal_achieved ? "text-emerald-400" : "text-red-400"
-                }`}
-              >
-                {taskResult.goal_achieved ? "✓ Goal achieved" : "✗ Goal not achieved"}
-              </p>
-            </div>
-
-            <div className="grid grid-cols-3 gap-3 mb-4">
-              <div className="bg-gray-800 rounded-lg p-3 text-center">
-                <p className="text-gray-500 text-xs mb-1">Score</p>
-                <p className="text-white font-semibold">{taskResult.total_score ?? "—"}/50</p>
-              </div>
-              <div className="bg-gray-800 rounded-lg p-3 text-center">
-                <p className="text-gray-500 text-xs mb-1">Quality</p>
-                <p
-                  className={`font-semibold text-sm capitalize ${
-                    taskResult.trajectory_quality === "high"
-                      ? "text-emerald-400"
-                      : taskResult.trajectory_quality === "medium"
-                      ? "text-yellow-400"
-                      : "text-red-400"
-                  }`}
-                >
-                  {taskResult.trajectory_quality ?? "—"}
-                </p>
-              </div>
-              <div className="bg-gray-800 rounded-lg p-3 text-center">
-                <p className="text-gray-500 text-xs mb-1">Tool Calls</p>
-                <p className="text-white font-semibold">{taskResult.total_tool_calls ?? 0}</p>
-              </div>
-            </div>
-
-            <div className="flex gap-3">
-              <button
-                onClick={onClose}
-                className="flex-1 py-2 rounded-lg bg-gray-800 text-gray-400 hover:text-white text-sm transition-colors"
-              >
-                Close
-              </button>
-              <button
-                onClick={() => {
-                  onClose();
-                  if (taskResult.session_id) {
-                    window.location.href = `/agents/${agentId}/sessions/${taskResult.session_id}`;
-                  }
-                }}
-                className="flex-1 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors"
-              >
-                View Session
-              </button>
-            </div>
-          </div>
-        )}
-
+        {/* ── Error ──────────────────────────────────────────────── */}
         {status === "error" && (
           <div className="py-4 text-center">
             <p className="text-red-400 text-sm mb-2">Run failed</p>
@@ -932,7 +1082,10 @@ export default function SessionsList({ agentId }: { agentId: string }) {
                     {s.session_id.slice(0, 8)}…
                   </td>
                   <td className="px-4 py-3">
-                    <ExperimentTypeBadge type={s.experiment_type ?? "conversation"} />
+                    <div className="flex items-center gap-1 flex-wrap">
+                      <ExperimentTypeBadge type={s.experiment_type ?? "conversation"} />
+                      {s.batch_role === "challenger" && <ChallengerPill />}
+                    </div>
                   </td>
                   <td className="px-4 py-3">
                     {(!s.experiment_type || s.experiment_type === "conversation") ? (

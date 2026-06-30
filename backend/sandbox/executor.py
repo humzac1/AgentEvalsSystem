@@ -18,6 +18,7 @@ Supported operation types:
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from typing import Any
 
@@ -64,9 +65,38 @@ class SandboxExecutor:
         for s in seed_data:
             col = s["collection_name"]
             records = copy.deepcopy(s.get("records", []))
+            if not records:
+                continue
             if col not in self._store:
                 self._store[col] = []
-            self._store[col].extend(records)
+
+            # _read() looks up by rec.get("id"), but seed records commonly use
+            # collection-specific keys (customer_id, invoice_id, etc.) with no
+            # generic "id" field.  Promote the collection-specific key to "id"
+            # so all lookup paths work uniformly.  Mirror the col[:-1]_id
+            # pattern already used by _read() for input resolution.
+            col_id_key = f"{col[:-1]}_id"
+            existing_ids = {
+                str(r["id"]) for r in self._store[col] if r.get("id") is not None
+            }
+
+            for record in records:
+                if "id" not in record and col_id_key in record:
+                    record["id"] = record[col_id_key]
+                # Deduplicate: multiple tools can seed the same collection with
+                # overlapping records; merge by id rather than blindly extending.
+                rec_id = record.get("id")
+                if rec_id is not None and str(rec_id) in existing_ids:
+                    continue
+                if rec_id is not None:
+                    existing_ids.add(str(rec_id))
+                self._store[col].append(record)
+
+        store_counts = {col: len(recs) for col, recs in self._store.items()}
+        print(
+            f"[SandboxExecutor] Initialized store with collections: "
+            f"{list(self._store.keys())} — record counts: {store_counts}"
+        )
 
         # Call log for this session
         self._call_log: list[dict] = []
@@ -81,6 +111,8 @@ class SandboxExecutor:
         tool = self._tools.get(tool_name)
         if not tool:
             return self._error(f"Unknown tool: {tool_name}")
+
+        inputs = self._coerce_inputs(inputs, tool)
 
         op = tool["operation_type"].upper()
         col = tool["collection_name"]
@@ -192,12 +224,10 @@ class SandboxExecutor:
         return {"sent": True, "record": record}
 
     def _calculate(self, inputs: dict) -> dict:
-        """
-        Simple calculator. Expects keys like:
-          operation: "add" | "subtract" | "multiply" | "divide"
-          a: number
-          b: number
-        """
+        if "line_items" in inputs:
+            return self._calculate_invoice(inputs)
+
+        # Simple arithmetic path
         op = str(inputs.get("operation", "add")).lower()
         try:
             a = float(inputs.get("a", 0))
@@ -220,7 +250,66 @@ class SandboxExecutor:
 
         return {"result": result, "operation": op, "a": a, "b": b}
 
+    def _calculate_invoice(self, inputs: dict) -> dict:
+        line_items = inputs.get("line_items", [])
+        if isinstance(line_items, str):
+            try:
+                line_items = json.loads(line_items)
+            except (json.JSONDecodeError, ValueError):
+                line_items = []
+        if not isinstance(line_items, list):
+            line_items = []
+
+        subtotal = sum(
+            float(item.get("hours", 0)) * float(item.get("rate", 0))
+            for item in line_items
+        )
+
+        rush = inputs.get("rush", False)
+        if isinstance(rush, str):
+            rush = rush.lower() in ("true", "1", "yes")
+        rush_surcharge = round(subtotal * 0.25, 2) if rush else 0.0
+
+        discount_type = str(inputs.get("discount_type", "none")).lower().strip()
+        discount_pct = 0.0
+        if discount_type == "retainer":
+            discount_pct = 8.0
+        elif discount_type == "new_client":
+            discount_pct = 5.0
+        elif discount_type == "volume" and subtotal > 50000:
+            discount_pct = 10.0
+
+        discount_amount = round(subtotal * (discount_pct / 100), 2)
+        total = round(subtotal + rush_surcharge - discount_amount, 2)
+
+        return {
+            "subtotal": round(subtotal, 2),
+            "rush_surcharge": rush_surcharge,
+            "discount_percentage": discount_pct,
+            "discount_amount": discount_amount,
+            "total": total,
+        }
+
     # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _coerce_inputs(self, inputs: dict, tool_def: dict) -> dict:
+        """Parse string values to array/object when the schema declares them as such."""
+        props = tool_def.get("input_schema", {})
+        if isinstance(props, dict):
+            props = props.get("properties", {})
+        if not isinstance(props, dict):
+            return inputs
+        coerced = {}
+        for key, value in inputs.items():
+            field_def = props.get(key, {})
+            expected_type = field_def.get("type", "string") if isinstance(field_def, dict) else "string"
+            if expected_type in ("array", "object") and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            coerced[key] = value
+        return coerced
 
     @staticmethod
     def _error(message: str) -> dict:

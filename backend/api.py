@@ -21,6 +21,7 @@ import json
 import uuid
 import threading
 import io
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +63,8 @@ from database import (
     delete_persona,
     get_session_count,
     get_avg_score,
+    create_batch,
+    update_batch_stats,
     # Tools
     get_all_tools,
     get_tool,
@@ -1056,6 +1059,390 @@ def poll_task_run(agent_id: str, run_id: str):
     if not state:
         raise HTTPException(status_code=404, detail="Run ID not found")
     return state
+
+
+# ── Batch-with-optimizer helpers ──────────────────────────────────────────────
+
+def _profile_key(name: str) -> str:
+    return name.lower().replace(" ", "_")
+
+
+def _generate_challenger_prompt(
+    current_prompt: str,
+    batch_results: list[dict],
+    focus_area: str = "",
+    agent_name: str = "the agent",
+    agent_domain: str = "general",
+) -> str:
+    client = _anthropic.Anthropic()
+
+    parts = []
+    for r in batch_results:
+        ev = r.get("evaluation", {})
+        failures = ev.get("failure_modes", [])
+        standouts = ev.get("standout_moments", [])
+        parts.append(
+            f"Profile: {r.get('user_profile', '?')} | Score: {ev.get('total_score', 0)}/50 "
+            f"| Goal achieved: {ev.get('hidden_goal_achieved')}\n"
+            f"Failure modes: {', '.join(failures) if failures else 'none'}\n"
+            f"Standout moments: {', '.join(standouts) if standouts else 'none'}"
+        )
+
+    focus_line = f"\n\nFOCUS AREA FOR IMPROVEMENT: {focus_area.strip()}" if focus_area.strip() else ""
+
+    meta_prompt = f"""You are an expert at writing system prompts for AI agents.{focus_line}
+
+Rewrite the system prompt below to address the observed failure modes and improve overall performance.
+
+AGENT CONTEXT:
+- Agent Name: {agent_name}
+- Domain: {agent_domain}
+
+CURRENT SYSTEM PROMPT:
+---
+{current_prompt}
+---
+
+EVALUATION RESULTS:
+---
+{chr(10).join(parts) if parts else "No evaluation data available."}
+---
+
+RULES:
+1. Do NOT change the agent identity, company, or domain.
+2. Keep all tool use instructions exactly as-is — do not remove or rename any tools.
+3. Address each failure mode with a specific, actionable guideline.
+4. Stay within 50% of the original word count.
+5. Output ONLY the new system prompt — no preamble, no explanation, no markdown fences.
+
+Write the improved system prompt now:"""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": meta_prompt}],
+    )
+    return response.content[0].text.strip()
+
+
+def _run_personas_batch(
+    run_id: str,
+    phase: str,
+    experiment_type: str,
+    task_id_arg: Optional[str],
+    total_runs: int,
+    difficulty: int,
+    batch_id: str,
+    batch_role: str,
+    prompt_override: Optional[str],
+    prompt_version_id: Optional[int],
+    personas: list,
+    db,
+    agent_name: str,
+    agent_domain: str,
+) -> tuple[list, bool]:
+    """Run a batch of simulations. Returns (results, stopped_early)."""
+    from simulation_runner import SimulationRunner
+
+    create_batch(batch_id, prompt_version_id, in_optimizer_run=False, db_path=db)
+
+    results: list[dict] = []
+    stopped = False
+
+    if experiment_type == "conversation" and personas:
+        k = len(personas)
+        last_goals: dict[str, str] = {}
+
+        for i in range(total_runs):
+            with _runs_lock:
+                if _runs[run_id]["cancel_requested"]:
+                    stopped = True
+                    break
+
+            persona = personas[i % k]
+            pid = persona["persona_id"]
+            goals = persona.get("hidden_goals") or []
+            if not goals:
+                goals = ["Complete your onboarding successfully"]
+
+            last = last_goals.get(pid)
+            if len(goals) > 1 and last in goals:
+                available = [g for g in goals if g != last]
+            else:
+                available = goals
+            goal = random.choice(available)
+            last_goals[pid] = goal
+
+            runs_per_persona = max(1, total_runs // k)
+            persona_run_num = (i // k) + 1
+
+            with _runs_lock:
+                _runs[run_id]["current_run"] = i + 1
+                _runs[run_id]["persona_name"] = persona["name"]
+                _runs[run_id]["persona_run"] = persona_run_num
+                _runs[run_id]["persona_runs_total"] = runs_per_persona
+
+            runner = SimulationRunner(
+                user_profile=_profile_key(persona["name"]),
+                hidden_goal=goal,
+                verbose=False,
+                difficulty=difficulty,
+                batch_id=batch_id,
+                prompt_version_id=prompt_version_id,
+                prompt_override=prompt_override,
+                db_path=db,
+                agent_name=agent_name,
+                agent_domain=agent_domain,
+                persona_name=persona["name"],
+                persona_description=persona.get("description", "")[:200],
+                batch_role=batch_role,
+            )
+            results.append(runner.run())
+
+    else:
+        task = get_task(task_id_arg, db_path=db) if task_id_arg else None
+
+        for i in range(total_runs):
+            with _runs_lock:
+                if _runs[run_id]["cancel_requested"]:
+                    stopped = True
+                    break
+                _runs[run_id]["current_run"] = i + 1
+                _runs[run_id]["persona_name"] = None
+
+            if task:
+                runner = SimulationRunner(
+                    user_profile=task["experiment_type"],
+                    hidden_goal=task["description"],
+                    verbose=False,
+                    difficulty=difficulty,
+                    batch_id=batch_id,
+                    prompt_version_id=prompt_version_id,
+                    prompt_override=prompt_override,
+                    db_path=db,
+                    agent_name=agent_name,
+                    agent_domain=agent_domain,
+                    experiment_type=task["experiment_type"],
+                    task_id=task["task_id"],
+                    task_title=task["title"],
+                    expected_tool_calls=task.get("expected_tool_calls", []),
+                    expected_final_state=task.get("expected_final_state", {}),
+                    batch_role=batch_role,
+                )
+                results.append(runner.run())
+
+    update_batch_stats(batch_id, db_path=db)
+    return results, stopped
+
+
+def _batch_quality_counts(results: list[dict]) -> dict:
+    counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+    for r in results:
+        q = (r.get("evaluation") or {}).get("trajectory_quality") or "low"
+        counts[q] = counts.get(q, 0) + 1
+    return counts
+
+
+def _batch_avg_score(results: list[dict]) -> float:
+    scores = [(r.get("evaluation") or {}).get("total_score") or 0 for r in results]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _batch_goal_rate(results: list[dict]) -> float:
+    goals = [(r.get("evaluation") or {}).get("hidden_goal_achieved", False) for r in results]
+    return sum(1 for g in goals if g) / len(goals) if goals else 0.0
+
+
+# ── Run-batch-with-optimizer endpoint ─────────────────────────────────────────
+
+class RunBatchWithOptimizerRequest(BaseModel):
+    experiment_type: str = Field(default="conversation")
+    task_id: Optional[str] = None
+    total_runs: int = Field(default=3, ge=1, le=100)
+    difficulty: int = Field(default=1, ge=1, le=5)
+    optimizer_enabled: bool = Field(default=False)
+    optimizer_mode: str = Field(default="auto")  # "auto" | "manual"
+    optimizer_focus: str = Field(default="")
+    challenger_prompt: Optional[str] = None
+
+
+@app.post("/api/agents/{agent_id}/run-batch-with-optimizer")
+def run_batch_with_optimizer(agent_id: str, request: RunBatchWithOptimizerRequest):
+    """Run a batch of simulations with an optional challenger-prompt comparison step."""
+    db = _resolve_agent(agent_id)
+    agent_record = get_agent(agent_id)
+    agent_name = agent_record.get("name", "the agent") if agent_record else "the agent"
+    agent_domain = agent_record.get("domain", "general") if agent_record else "general"
+
+    run_id = str(uuid.uuid4())
+    with _runs_lock:
+        _runs[run_id] = {
+            "status": "running",
+            "phase": "primary",
+            "current_run": 0,
+            "total_runs": request.total_runs,
+            "persona_name": None,
+            "persona_run": None,
+            "persona_runs_total": None,
+            "cancel_requested": False,
+            "stopped_early": False,
+            "primary_complete": False,
+            "primary_avg": None,
+            "primary_goal_rate": None,
+            "primary_quality_counts": None,
+            "challenger_prompt_text": None,
+            "result": None,
+            "error": None,
+        }
+
+    def _run():
+        try:
+            personas = []
+            if request.experiment_type == "conversation":
+                personas = get_all_personas(db_path=db)
+
+            # ── Primary batch ──────────────────────────────────────────────
+            primary_batch_id = str(uuid.uuid4())
+            primary_results, stopped = _run_personas_batch(
+                run_id=run_id,
+                phase="primary",
+                experiment_type=request.experiment_type,
+                task_id_arg=request.task_id,
+                total_runs=request.total_runs,
+                difficulty=request.difficulty,
+                batch_id=primary_batch_id,
+                batch_role="primary",
+                prompt_override=None,
+                prompt_version_id=None,
+                personas=personas,
+                db=db,
+                agent_name=agent_name,
+                agent_domain=agent_domain,
+            )
+
+            primary_avg = _batch_avg_score(primary_results)
+            primary_goal_rate = _batch_goal_rate(primary_results)
+            q_counts = _batch_quality_counts(primary_results)
+
+            with _runs_lock:
+                _runs[run_id]["primary_complete"] = True
+                _runs[run_id]["primary_avg"] = primary_avg
+                _runs[run_id]["primary_goal_rate"] = primary_goal_rate
+                _runs[run_id]["primary_quality_counts"] = q_counts
+
+            if stopped or not request.optimizer_enabled:
+                with _runs_lock:
+                    _runs[run_id]["stopped_early"] = stopped
+                    _runs[run_id]["status"] = "complete"
+                    _runs[run_id]["result"] = {
+                        "total_runs": len(primary_results),
+                        "quality_counts": q_counts,
+                        "primary_avg": primary_avg,
+                        "optimizer_enabled": False,
+                    }
+                _refresh_agent_stats(agent_id, db)
+                return
+
+            # ── Generate challenger prompt ──────────────────────────────────
+            with _runs_lock:
+                _runs[run_id]["phase"] = "generating_challenger"
+
+            active = get_active_prompt(db_path=db)
+            current_prompt = active["prompt_text"] if active else ""
+
+            if request.optimizer_mode == "manual" and request.challenger_prompt:
+                challenger_text = request.challenger_prompt
+            else:
+                challenger_text = _generate_challenger_prompt(
+                    current_prompt=current_prompt,
+                    batch_results=primary_results,
+                    focus_area=request.optimizer_focus or "",
+                    agent_name=agent_name,
+                    agent_domain=agent_domain,
+                )
+
+            with _runs_lock:
+                _runs[run_id]["challenger_prompt_text"] = challenger_text
+
+            # ── Challenger batch ────────────────────────────────────────────
+            with _runs_lock:
+                _runs[run_id]["phase"] = "challenger"
+                _runs[run_id]["current_run"] = 0
+
+            challenger_batch_id = str(uuid.uuid4())
+            challenger_results, _ = _run_personas_batch(
+                run_id=run_id,
+                phase="challenger",
+                experiment_type=request.experiment_type,
+                task_id_arg=request.task_id,
+                total_runs=request.total_runs,
+                difficulty=request.difficulty,
+                batch_id=challenger_batch_id,
+                batch_role="challenger",
+                prompt_override=challenger_text,
+                prompt_version_id=None,
+                personas=personas,
+                db=db,
+                agent_name=agent_name,
+                agent_domain=agent_domain,
+            )
+
+            challenger_avg = _batch_avg_score(challenger_results)
+            challenger_goal_rate = _batch_goal_rate(challenger_results)
+            delta = challenger_avg - primary_avg
+
+            if challenger_goal_rate == 0 and challenger_results:
+                decision = "rejected_zero_goals"
+            elif delta > 0:
+                decision = "challenger_wins"
+            else:
+                decision = "challenger_loses"
+
+            with _runs_lock:
+                _runs[run_id]["status"] = "complete"
+                _runs[run_id]["result"] = {
+                    "total_runs": len(primary_results),
+                    "quality_counts": q_counts,
+                    "primary_avg": primary_avg,
+                    "primary_goal_rate": primary_goal_rate,
+                    "challenger_avg": challenger_avg,
+                    "challenger_goal_rate": challenger_goal_rate,
+                    "delta": delta,
+                    "decision": decision,
+                    "challenger_prompt_text": challenger_text,
+                    "optimizer_enabled": True,
+                }
+
+            _refresh_agent_stats(agent_id, db)
+
+        except Exception as e:
+            with _runs_lock:
+                _runs[run_id]["status"] = "error"
+                _runs[run_id]["error"] = str(e)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"run_id": run_id, "status": "running"}
+
+
+@app.get("/api/agents/{agent_id}/run-batch-with-optimizer/{run_id}")
+def poll_batch_with_optimizer(agent_id: str, run_id: str):
+    _resolve_agent(agent_id)
+    with _runs_lock:
+        state = _runs.get(run_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Run ID not found")
+    return state
+
+
+@app.post("/api/agents/{agent_id}/run-batch-with-optimizer/{run_id}/cancel")
+def cancel_batch_run(agent_id: str, run_id: str):
+    _resolve_agent(agent_id)
+    with _runs_lock:
+        state = _runs.get(run_id)
+        if not state:
+            raise HTTPException(status_code=404, detail="Run ID not found")
+        state["cancel_requested"] = True
+    return {"cancelled": True}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

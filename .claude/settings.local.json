@@ -26,7 +26,21 @@
       "Bash(/Users/humzac/AgentSimLabHR/.venv/bin/python3 -c \"\nimport sys, sqlite3; sys.path.insert\\(0, 'backend'\\)\ndb = '/Users/humzac/AgentSimLabHR/data/agents/2a21dd2d-eeaa-4e4b-aec2-39a0e30094bc.db'\nconn = sqlite3.connect\\(db\\)\nprint\\('sessions:', conn.execute\\('SELECT COUNT\\(*\\) FROM sessions'\\).fetchone\\(\\)[0]\\)\nprint\\('turns:', conn.execute\\('SELECT COUNT\\(*\\) FROM turns'\\).fetchone\\(\\)[0]\\)\nprint\\('evaluations:', conn.execute\\('SELECT COUNT\\(*\\) FROM evaluations'\\).fetchone\\(\\)[0]\\)\nprint\\('batches:', conn.execute\\('SELECT COUNT\\(*\\) FROM batches'\\).fetchone\\(\\)[0]\\)\nprint\\('prompt_versions:', conn.execute\\('SELECT COUNT\\(*\\) FROM prompt_versions'\\).fetchone\\(\\)[0]\\)\nprint\\('personas:', conn.execute\\('SELECT COUNT\\(*\\) FROM personas'\\).fetchone\\(\\)[0]\\)\nprint\\('documents:', conn.execute\\('SELECT COUNT\\(*\\) FROM documents'\\).fetchone\\(\\)[0]\\)\nconn.close\\(\\)\n\")",
       "Bash(/Users/humzac/AgentSimLabHR/.venv/bin/python3 -c \"\nimport sys, sqlite3; sys.path.insert\\(0, 'backend'\\)\ndb = '/Users/humzac/AgentSimLabHR/data/agents/2a21dd2d-eeaa-4e4b-aec2-39a0e30094bc.db'\nfrom database import init_db\ninit_db\\(db_path=db\\)\n\nconn = sqlite3.connect\\(db\\)\nconn.execute\\('PRAGMA foreign_keys = OFF'\\)\nconn.execute\\('DELETE FROM evaluations'\\)\nconn.execute\\('DELETE FROM turns'\\)\nconn.execute\\('DELETE FROM sessions'\\)\nconn.execute\\('''UPDATE batches SET\n    session_count = 0,\n    avg_total_score = NULL,\n    goal_achievement_rate = NULL,\n    avg_goal_achievement = NULL,\n    avg_response_quality = NULL,\n    avg_handling = NULL,\n    avg_staying_in_scope = NULL'''\\)\nconn.commit\\(\\)\nprint\\('sessions:', conn.execute\\('SELECT COUNT\\(*\\) FROM sessions'\\).fetchone\\(\\)[0]\\)\nprint\\('turns:', conn.execute\\('SELECT COUNT\\(*\\) FROM turns'\\).fetchone\\(\\)[0]\\)\nprint\\('evaluations:', conn.execute\\('SELECT COUNT\\(*\\) FROM evaluations'\\).fetchone\\(\\)[0]\\)\nprint\\('batches:', conn.execute\\('SELECT COUNT\\(*\\) FROM batches'\\).fetchone\\(\\)[0]\\)\nprint\\('prompt_versions:', conn.execute\\('SELECT COUNT\\(*\\) FROM prompt_versions'\\).fetchone\\(\\)[0]\\)\nprint\\('personas:', conn.execute\\('SELECT COUNT\\(*\\) FROM personas'\\).fetchone\\(\\)[0]\\)\nprint\\('documents:', conn.execute\\('SELECT COUNT\\(*\\) FROM documents'\\).fetchone\\(\\)[0]\\)\nconn.close\\(\\)\nprint\\('Done.'\\)\n\")",
       "Bash(/Users/humzac/AgentSimLabHR/.venv/bin/python3 -c \"\nimport sys, sqlite3; sys.path.insert\\(0, 'backend'\\)\ndb = '/Users/humzac/AgentSimLabHR/data/agents/2a21dd2d-eeaa-4e4b-aec2-39a0e30094bc.db'\nconn = sqlite3.connect\\(db\\)\nconn.row_factory = sqlite3.Row\nrows = conn.execute\\('SELECT version_id, version_number, is_active, change_summary, created_at FROM prompt_versions ORDER BY version_number'\\).fetchall\\(\\)\nfor r in rows:\n    print\\(dict\\(r\\)\\)\nprint\\(\\)\nrows2 = conn.execute\\('SELECT batch_id, prompt_version_id, ran_at, session_count, optimizer_accepted, in_optimizer_run FROM batches ORDER BY ran_at'\\).fetchall\\(\\)\nfor r in rows2:\n    print\\(dict\\(r\\)\\)\nconn.close\\(\\)\n\")",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(sqlite3 *)",
+      "Bash(.venv/bin/python *)",
+      "Bash(.venv/bin/uvicorn backend.api:app --port 8001 --log-level warning)",
+      "Bash(curl -s http://localhost:8001/api/agents/06e6b5ff-fbbf-4875-ac86-b9789c7c3dfa/sessions/ef2edb4a-7371-4458-a791-c4a71d877cf0/tool-calls)",
+      "Bash(curl -s http://localhost:8001/api/agents/06e6b5ff-fbbf-4875-ac86-b9789c7c3dfa/sessions/ef2edb4a-7371-4458-a791-c4a71d877cf0)",
+      "Bash(pkill -f \"uvicorn backend.api:app --port 8001\")",
+      "Bash(.venv/bin/python3 *)",
+      "Bash(.venv/bin/uvicorn backend.api:app --port 8002 --log-level warning)",
+      "Bash(curl -s http://localhost:8002/api/agents/06e6b5ff-fbbf-4875-ac86-b9789c7c3dfa/sessions/98e82879-58bb-4ed1-b501-ebbf60f3080b/tool-calls)",
+      "Bash(pkill -f \"uvicorn backend.api:app --port 8002\")",
+      "Bash(.venv/bin/uvicorn backend.api:app --port 8003 --log-level warning)",
+      "Bash(curl -s http://localhost:8003/api/agents/06e6b5ff-fbbf-4875-ac86-b9789c7c3dfa/sessions/0a7abb5a-df87-43d1-b930-d113abd2a858/tool-calls)",
+      "Bash(pkill -f \"uvicorn backend.api:app --port 8003\")",
+      "Bash(npx vite *)"
     ]
   }
 }

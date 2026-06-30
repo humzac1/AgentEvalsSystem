@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Union
 
 from agents.user_agent import get_user_agent
-from agents.hr_agent import get_hr_agent
+from agents.conversation_agent import get_conversation_agent
 from agents.judge_agent import evaluate_conversation, evaluate_task
 from agents.agent_under_test import run_task_session, get_single_agent_reply
 from database import (
@@ -72,6 +72,7 @@ class SimulationRunner:
         task_title: str = "",
         expected_tool_calls: list | None = None,
         expected_final_state: dict | None = None,
+        batch_role: str | None = None,
     ):
         self.user_profile = user_profile
         self.hidden_goal = hidden_goal
@@ -90,6 +91,7 @@ class SimulationRunner:
         self.task_title = task_title
         self.expected_tool_calls = expected_tool_calls or []
         self.expected_final_state = expected_final_state or {}
+        self.batch_role = batch_role
         self.session_id = str(uuid.uuid4())
         self.transcript: list[dict] = []
         self.turn_number = 0
@@ -144,6 +146,7 @@ class SimulationRunner:
             prompt_version_id=self.prompt_version_id,
             experiment_type=self.experiment_type,
             task_id=self.task_id,
+            batch_role=self.batch_role,
             db_path=self.db_path,
         )
 
@@ -165,18 +168,15 @@ class SimulationRunner:
             db_path=self.db_path,
         )
 
-        # Use executor-aware agent if tools exist, otherwise legacy Agno agent
+        # Use executor-aware agent if tools exist, otherwise Agno conversation agent
         if executor:
             hr_reply_fn = lambda msg, hist: self._agent_with_tools_reply(
                 prompt_text, msg, hist, executor
             )
             history: list[dict] = []
         else:
-            hr_agent = get_hr_agent(
-                prompt_override=self.prompt_override,
-                db_path=self.db_path,
-            )
-            hr_reply_fn = lambda msg, _hist: self._agno_reply(hr_agent, msg)
+            conv_agent = get_conversation_agent(prompt_text, db_path=self.db_path)
+            hr_reply_fn = lambda msg, _hist: self._agno_reply(conv_agent, msg)
             history = None  # not used for Agno path
 
         conversation_complete = False
@@ -307,7 +307,8 @@ You are operating in automated task execution mode. A task will be given to you 
 - Call the required tool(s), receive the results, and present the complete results directly in your response
 - Your response should be the actual output — the data, the result, the completed action — not a description of what you are doing
 - If a task requires multiple tool calls, complete all of them before responding
-- Do not ask clarifying questions — execute the task as described"""
+- Do not ask clarifying questions — execute the task as described
+- Your response is complete when you have presented the task output. Do not ask follow-up questions, offer next steps, or invite further action. End your response after the output."""
 
     def _run_task(self) -> dict:
         base_prompt = self._get_prompt()
