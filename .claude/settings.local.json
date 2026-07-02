@@ -40,7 +40,9 @@
       "Bash(.venv/bin/uvicorn backend.api:app --port 8003 --log-level warning)",
       "Bash(curl -s http://localhost:8003/api/agents/06e6b5ff-fbbf-4875-ac86-b9789c7c3dfa/sessions/0a7abb5a-df87-43d1-b930-d113abd2a858/tool-calls)",
       "Bash(pkill -f \"uvicorn backend.api:app --port 8003\")",
-      "Bash(npx vite *)"
+      "Bash(npx vite *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)"
     ]
   }
 }

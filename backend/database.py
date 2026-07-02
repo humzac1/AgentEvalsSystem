@@ -187,6 +187,7 @@ def init_db(db_path: Union[str, Path, None] = None) -> None:
             ("experiment_type", "TEXT DEFAULT 'conversation'"),
             ("task_id", "TEXT"),
             ("batch_role", "TEXT"),
+            ("langfuse_trace_url", "TEXT"),
         ]:
             if col not in existing_session_cols:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {definition}")
@@ -448,6 +449,18 @@ def save_session(
         )
 
 
+def update_session_trace_url(
+    session_id: str,
+    url: str,
+    db_path: Union[str, Path, None] = None,
+) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE sessions SET langfuse_trace_url = ? WHERE session_id = ?",
+            (url, session_id),
+        )
+
+
 def save_turn(
     session_id: str,
     turn_number: int,
@@ -514,7 +527,8 @@ def get_all_sessions(db_path: Union[str, Path, None] = None) -> list[dict]:
         rows = conn.execute(
             """SELECT session_id, user_profile, hidden_goal, timestamp,
                       total_score, trajectory_quality, difficulty, batch_id,
-                      prompt_version_id, experiment_type, task_id, batch_role
+                      prompt_version_id, experiment_type, task_id, batch_role,
+                      langfuse_trace_url
                FROM sessions ORDER BY timestamp DESC"""
         ).fetchall()
         return [dict(r) for r in rows]

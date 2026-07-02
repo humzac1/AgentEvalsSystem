@@ -19,8 +19,13 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
+import os
 import uuid
 from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from observability import langfuse
 
 # Prefix map for ID generation: collection_name substring → prefix
 _ID_PREFIX_MAP = {
@@ -118,22 +123,29 @@ class SandboxExecutor:
         col = tool["collection_name"]
 
         try:
-            if op == "CREATE":
-                result = self._create(col, inputs)
-            elif op == "READ":
-                result = self._read(col, inputs)
-            elif op == "UPDATE":
-                result = self._update(col, inputs)
-            elif op == "DELETE":
-                result = self._delete(col, inputs)
-            elif op == "LIST":
-                result = self._list(col, inputs)
-            elif op == "SEND":
-                result = self._send(col, inputs)
-            elif op == "CALCULATE":
-                result = self._calculate(inputs)
-            else:
-                return self._error(f"Unknown operation type: {op}")
+            with langfuse.start_as_current_observation(
+                name=f"tool-call-{tool_name}",
+                as_type="span",
+                input={"tool": tool_name, "inputs": inputs},
+            ) as _span:
+                if op == "CREATE":
+                    result = self._create(col, inputs)
+                elif op == "READ":
+                    result = self._read(col, inputs)
+                elif op == "UPDATE":
+                    result = self._update(col, inputs)
+                elif op == "DELETE":
+                    result = self._delete(col, inputs)
+                elif op == "LIST":
+                    result = self._list(col, inputs)
+                elif op == "SEND":
+                    result = self._send(col, inputs)
+                elif op == "CALCULATE":
+                    result = self._calculate(inputs)
+                else:
+                    _span.update(output={"success": False, "error": f"Unknown operation: {op}"})
+                    return self._error(f"Unknown operation type: {op}")
+                _span.update(output={"result": result, "success": True, "error": None})
         except Exception as exc:
             return self._error(str(exc))
 

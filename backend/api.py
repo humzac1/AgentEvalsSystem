@@ -118,6 +118,15 @@ def startup_event():
     init_registry()
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        from observability import langfuse
+        langfuse.flush()
+    except Exception:
+        pass
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _resolve_agent(agent_id: str) -> Path:
@@ -1443,6 +1452,71 @@ def cancel_batch_run(agent_id: str, run_id: str):
             raise HTTPException(status_code=404, detail="Run ID not found")
         state["cancel_requested"] = True
     return {"cancelled": True}
+
+
+# ── Langfuse qualitative evaluation ──────────────────────────────────────────
+
+from fastapi.responses import StreamingResponse
+from langfuse_eval import (
+    get_agent_trace_comments,
+    propose_axial_codes,
+    assign_axial_codes,
+    build_csv,
+)
+
+
+class _ProposeCodesRequest(BaseModel):
+    open_codes: list[dict]
+
+
+class _AssignCodesRequest(BaseModel):
+    open_codes: list[dict]
+    confirmed_categories: list[str]
+
+
+class _ExportCsvRequest(BaseModel):
+    coded_sessions: list[dict]
+    frequencies: dict
+
+
+@app.get("/api/agents/{agent_id}/langfuse-comments")
+def get_langfuse_comments(agent_id: str):
+    db = _resolve_agent(agent_id)
+    return get_agent_trace_comments(agent_id, db)
+
+
+@app.post("/api/agents/{agent_id}/evaluate/propose-codes")
+def evaluate_propose_codes(agent_id: str, body: _ProposeCodesRequest):
+    _resolve_agent(agent_id)
+    if not body.open_codes:
+        raise HTTPException(status_code=400, detail="open_codes is required")
+    categories = propose_axial_codes(body.open_codes)
+    return {"proposed_categories": categories}
+
+
+@app.post("/api/agents/{agent_id}/evaluate/assign-codes")
+def evaluate_assign_codes(agent_id: str, body: _AssignCodesRequest):
+    _resolve_agent(agent_id)
+    if not body.open_codes or not body.confirmed_categories:
+        raise HTTPException(status_code=400, detail="open_codes and confirmed_categories are required")
+    coded, frequencies = assign_axial_codes(body.open_codes, body.confirmed_categories)
+    return {"coded_sessions": coded, "frequencies": frequencies}
+
+
+@app.post("/api/agents/{agent_id}/evaluate/export-csv")
+def evaluate_export_csv(agent_id: str, body: _ExportCsvRequest):
+    record = get_agent(agent_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent_name = record.get("name", agent_id).replace(" ", "_")
+    date_str = __import__("datetime").date.today().isoformat()
+    filename = f"axial_coding_{agent_name}_{date_str}.csv"
+    csv_content = build_csv(body.coded_sessions, body.frequencies)
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
