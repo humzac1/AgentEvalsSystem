@@ -11,21 +11,6 @@ Describe a agent in a "create a agent workspace" (can have tools), and run simul
 - **Backend**: FastAPI + SQLite
 - **Frontend**: React + Vite + Tailwind + Recharts
 
-## Agents
-
-### 1. Synthetic User Agent
-Simulates new employees with three profiles:
-- **`confused_novice`** — overwhelmed new hire, asks vague questions, needs clarification
-- **`impatient_expert`** — senior lateral hire, terse, pushes back on basic answers
-- **`adversarial_user`** — skeptical, questions policies, tries to bend rules
-
-### 2. HR Agent (Agent Under Test)
-Plays an HR onboarding assistant for Meridian Corp. Uses a Agno tool to look up the knowledge base (simulating RAG). Knowledge base covers: PTO, benefits, direct deposit, equipment, compliance training, and Slack access.
-
-### 3. Judge Agent
-Evaluates completed conversations on: resolution, clarity, handling difficulty, and policy accuracy (each 0–10, total 0–40). Outputs structured JSON with failure modes, standout moments, and trajectory quality (`high`/`medium`/`low`).
-
----
 
 ## Setup
 
@@ -112,43 +97,7 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173) in your browser.
 
----
 
-## Database Schema
-
-**`sessions`** — one row per simulation session
-| Column | Type | Notes |
-|---|---|---|
-| session_id | TEXT PK | UUID |
-| user_profile | TEXT | confused_novice / impatient_expert / adversarial_user |
-| hidden_goal | TEXT | What the user was trying to accomplish |
-| timestamp | TEXT | ISO UTC |
-| total_score | INTEGER | 0–40 (from judge) |
-| trajectory_quality | TEXT | high / medium / low |
-
-**`turns`** — one row per conversation turn
-| Column | Type | Notes |
-|---|---|---|
-| turn_id | INTEGER PK | Auto |
-| session_id | TEXT FK | References sessions |
-| turn_number | INTEGER | Sequential |
-| speaker | TEXT | user or agent |
-| message | TEXT | Message content |
-| timestamp | TEXT | ISO UTC |
-
-**`evaluations`** — one row per session evaluation
-| Column | Type | Notes |
-|---|---|---|
-| eval_id | INTEGER PK | Auto |
-| session_id | TEXT FK UNIQUE | References sessions |
-| judge_json | TEXT | Full judge output as JSON blob |
-| hidden_goal_achieved | INTEGER | 0 or 1 |
-| resolution_score | INTEGER | 0–10 |
-| clarity_score | INTEGER | 0–10 |
-| handling_difficulty_score | INTEGER | 0–10 |
-| policy_accuracy_score | INTEGER | 0–10 |
-
----
 
 ## Project Structure
 
@@ -181,24 +130,4 @@ AgentSimLabHR/
 └── README.md
 ```
 
----
 
-## Trajectory Quality
-
-Judge scores map to training data quality tiers:
-- **High** (≥30/40) — ideal for RL/DPO positive examples
-- **Medium** (≥20/40) — useful with careful filtering
-- **Low** (<20/40) — useful as negative examples for DPO
-
----
-
-## Meridian Corp Knowledge Base
-
-| Topic | Key Facts |
-|---|---|
-| PTO | 20 days/year, accrues monthly, **no rollover** |
-| Benefits | 30-day enrollment window from day 1 |
-| Direct Deposit | `meridian.adp.com` |
-| Equipment | IT ticket at `it.meridian.com` |
-| Compliance Training | 3 courses, must complete in **first 2 weeks** |
-| Slack Access | IT provisions after day 1, email `it@meridian.com` |
