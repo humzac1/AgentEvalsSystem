@@ -1,31 +1,8 @@
 # Agent Simulation Lab HR Onboarding Edition
 
-A mini simulation lab that runs an AI agent through realistic multi-turn conversations with synthetic users, scores each conversation automatically, and logs the trajectories as training-ready data.
+Simulations with evaluations.
 
-Inspired by Collinear AI's Simulation Lab concept.
-
-## Architecture
-
-```
-┌─────────────────────┐     ┌──────────────────────┐
-│  Synthetic User     │◄───►│  HR Agent (Under Test)│
-│  (agno Agent)       │     │  (agno Agent + tools) │
-└─────────────────────┘     └──────────────────────┘
-         │                            │
-         └──────────┬─────────────────┘
-                    │ transcript
-                    ▼
-         ┌─────────────────────┐
-         │   Judge Agent       │
-         │   (agno Agent)      │
-         └─────────────────────┘
-                    │ structured JSON scores
-                    ▼
-         ┌─────────────────────┐     ┌────────────────┐
-         │   SQLite DB         │◄───►│  FastAPI API   │◄───► React Frontend
-         │   (simulations.db)  │     │  (api.py)      │
-         └─────────────────────┘     └────────────────┘
-```
+Describe a agent in a "create a agent workspace" (can have tools), and run simulations based off of your current system prompt and tooling of whatever agent you want. Then agent is evaluated by a judge on certain metrics (need to be fixed to binary not scale). You can then attempt to use a prompt optimizer thats benchmarked against current prompts results. Also can evaluate current issues with agents performance through open and axial coding (a social science concept) to cluster errors.
 
 ## Stack
 
@@ -59,10 +36,15 @@ Evaluates completed conversations on: resolution, clarity, handling difficulty, 
 
 ### 1. Environment
 
-```bash
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
-```
+create env file with this:
+
+ANTHROPIC_API_KEY=
+
+LANGFUSE_SECRET_KEY=
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_BASE_URL=
+LANGFUSE_PROJECT_ID=
+
 
 ### 2. Python backend
 
