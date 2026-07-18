@@ -42,7 +42,13 @@
       "Bash(pkill -f \"uvicorn backend.api:app --port 8003\")",
       "Bash(npx vite *)",
       "Bash(pip install *)",
-      "Bash(pip3 install *)"
+      "Bash(pip3 install *)",
+      "Bash(timeout 30 bash -c 'until curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; do sleep 1; done')",
+      "Bash(timeout 30 bash -c 'until curl -sf http://127.0.0.1:5173 >/dev/null 2>&1; do sleep 1; done')",
+      "Bash(curl -sf http://127.0.0.1:8000/health)",
+      "Bash(break)",
+      "Bash(curl -sf http://127.0.0.1:5173)",
+      "Bash(grep -n \"I've reviewed all decisions\\\\|</table>\\\\s*$\" /Users/humzac/AgentSimLabHR/frontend/src/components/EvaluateModal.tsx)"
     ]
   }
 }

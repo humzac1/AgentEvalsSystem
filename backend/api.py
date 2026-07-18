@@ -1462,6 +1462,10 @@ from langfuse_eval import (
     propose_axial_codes,
     assign_axial_codes,
     build_csv,
+    generate_judge_prompts,
+    fetch_transcripts,
+    run_judges_stream,
+    build_judge_report_csv,
 )
 
 
@@ -1479,10 +1483,37 @@ class _ExportCsvRequest(BaseModel):
     frequencies: dict
 
 
+class _GenerateJudgePromptsRequest(BaseModel):
+    axial_codes: list[str]
+    open_codes: list[dict]
+    agent_name: str
+    agent_domain: str
+    session_type_breakdown: dict[str, int] = {}
+
+
+class _FetchTranscriptsRequest(BaseModel):
+    sessions: list[dict]
+
+
+class _RunJudgesRequest(BaseModel):
+    judges: list[dict]
+    transcripts: list[dict]
+
+
+class _ExportJudgeReportRequest(BaseModel):
+    judges: list[dict]
+    decisions: dict[str, dict[str, str]]
+    human_labels: dict[str, dict[str, bool]]
+    metrics: dict[str, dict[str, float]]
+    open_codes: list[dict]
+    agent_name: str
+    metrics_by_type: dict[str, dict[str, dict]] = {}
+
+
 @app.get("/api/agents/{agent_id}/langfuse-comments")
-def get_langfuse_comments(agent_id: str):
+def get_langfuse_comments(agent_id: str, limit: int | None = None):
     db = _resolve_agent(agent_id)
-    return get_agent_trace_comments(agent_id, db)
+    return get_agent_trace_comments(agent_id, db, limit=limit)
 
 
 @app.post("/api/agents/{agent_id}/evaluate/propose-codes")
@@ -1512,6 +1543,63 @@ def evaluate_export_csv(agent_id: str, body: _ExportCsvRequest):
     date_str = __import__("datetime").date.today().isoformat()
     filename = f"axial_coding_{agent_name}_{date_str}.csv"
     csv_content = build_csv(body.coded_sessions, body.frequencies)
+    return StreamingResponse(
+        iter([csv_content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/agents/{agent_id}/evaluate/generate-judge-prompts")
+def evaluate_generate_judge_prompts(agent_id: str, body: _GenerateJudgePromptsRequest):
+    _resolve_agent(agent_id)
+    if not body.axial_codes:
+        raise HTTPException(status_code=400, detail="axial_codes is required")
+    judges = generate_judge_prompts(
+        body.axial_codes,
+        body.open_codes,
+        body.agent_name,
+        body.agent_domain,
+        session_type_breakdown=body.session_type_breakdown,
+    )
+    return {"judges": judges}
+
+
+@app.post("/api/agents/{agent_id}/evaluate/fetch-transcripts")
+def evaluate_fetch_transcripts(agent_id: str, body: _FetchTranscriptsRequest):
+    db = _resolve_agent(agent_id)
+    if not body.sessions:
+        raise HTTPException(status_code=400, detail="sessions is required")
+    return {"transcripts": fetch_transcripts(body.sessions, db)}
+
+
+@app.post("/api/agents/{agent_id}/evaluate/run-judges")
+def evaluate_run_judges(agent_id: str, body: _RunJudgesRequest):
+    _resolve_agent(agent_id)
+    if not body.judges or not body.transcripts:
+        raise HTTPException(status_code=400, detail="judges and transcripts are required")
+    return StreamingResponse(
+        run_judges_stream(body.judges, body.transcripts),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.post("/api/agents/{agent_id}/evaluate/export-judge-report")
+def evaluate_export_judge_report(agent_id: str, body: _ExportJudgeReportRequest):
+    record = get_agent(agent_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent_name = body.agent_name.replace(" ", "_")
+    date_str = __import__("datetime").date.today().isoformat()
+    filename = f"judge_eval_{agent_name}_{date_str}.csv"
+    csv_content = build_judge_report_csv(
+        body.judges,
+        body.decisions,
+        body.human_labels,
+        body.metrics,
+        body.open_codes,
+        metrics_by_type=body.metrics_by_type,
+    )
     return StreamingResponse(
         iter([csv_content]),
         media_type="text/csv",
