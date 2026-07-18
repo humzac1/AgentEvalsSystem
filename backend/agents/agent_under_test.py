@@ -21,6 +21,10 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
 
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from observability import langfuse
+
 _client: anthropic.Anthropic | None = None
 
 
@@ -70,7 +74,7 @@ def call_agent(
                 "inputs": block.input,
             })
 
-    return "".join(text_parts), tool_calls, response.stop_reason, raw_content
+    return "".join(text_parts), tool_calls, response.stop_reason, raw_content, response.usage
 
 
 def run_task_session(
@@ -102,13 +106,34 @@ def run_task_session(
     total_tool_calls = 0
     final_text = ""
     completed = False
+    _agent_turn_num = 0
 
     while True:
-        text, tool_calls, stop_reason, raw_content = call_agent(
-            system_prompt=full_system,
-            messages=messages,
-            tools=api_tools if api_tools else None,
-        )
+        _agent_turn_num += 1
+        _input_snapshot = list(messages)
+        _gen_name = "agent-task-execution" if _agent_turn_num == 1 else f"agent-task-turn-{_agent_turn_num}"
+        try:
+            with langfuse.start_as_current_observation(
+                name=_gen_name,
+                as_type="generation",
+                model="claude-sonnet-4-6",
+                input=_input_snapshot,
+            ) as _gen:
+                text, tool_calls, stop_reason, raw_content, _usage = call_agent(
+                    system_prompt=full_system,
+                    messages=messages,
+                    tools=api_tools if api_tools else None,
+                )
+                _gen.update(
+                    output=text or "",
+                    usage_details={"input": _usage.input_tokens, "output": _usage.output_tokens} if _usage else None,
+                )
+        except Exception:
+            text, tool_calls, stop_reason, raw_content, _usage = call_agent(
+                system_prompt=full_system,
+                messages=messages,
+                tools=api_tools if api_tools else None,
+            )
 
         if verbose:
             if text:
@@ -208,50 +233,67 @@ def get_single_agent_reply(
     # return it; caller is responsible for using the returned prompt)
     full_system = system_prompt + tools_section
 
-    text, tool_calls, stop_reason, raw_content = call_agent(
-        system_prompt=full_system,
-        messages=messages,
-        tools=api_tools if api_tools else None,
-    )
-
+    _input_snapshot = list(messages)
     executed_calls = []
 
-    if tool_calls and executor:
-        # Build assistant message with tool_use blocks
-        assistant_content = []
-        for block in raw_content:
-            if block.type == "text":
-                assistant_content.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
-        messages.append({"role": "assistant", "content": assistant_content})
+    try:
+        with langfuse.start_as_current_observation(
+            name="agent-turn",
+            as_type="generation",
+            model="claude-sonnet-4-6",
+            input=_input_snapshot,
+        ) as _gen:
+            text, tool_calls, stop_reason, raw_content, _usage = call_agent(
+                system_prompt=full_system,
+                messages=messages,
+                tools=api_tools if api_tools else None,
+            )
 
-        # Execute each tool, collect results
-        tool_results = []
-        for tc in tool_calls:
-            result = executor.execute(tc["tool_name"], tc["inputs"])
-            result_text = str(result.get("result", result.get("error", "no result")))
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tc["tool_use_id"],
-                "content": result_text,
-            })
-            executed_calls.append({**tc, "result": result_text})
+            if tool_calls and executor:
+                assistant_content = []
+                for block in raw_content:
+                    if block.type == "text":
+                        assistant_content.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        })
+                messages.append({"role": "assistant", "content": assistant_content})
 
-        messages.append({"role": "user", "content": tool_results})
+                tool_results = []
+                for tc in tool_calls:
+                    result = executor.execute(tc["tool_name"], tc["inputs"])
+                    result_text = str(result.get("result", result.get("error", "no result")))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tc["tool_use_id"],
+                        "content": result_text,
+                    })
+                    executed_calls.append({**tc, "result": result_text})
 
-        # Get final text after tool execution
-        text2, _, _, _ = call_agent(
+                messages.append({"role": "user", "content": tool_results})
+
+                text2, _, _, _, _usage2 = call_agent(
+                    system_prompt=full_system,
+                    messages=messages,
+                    tools=api_tools if api_tools else None,
+                )
+                if text2:
+                    text = (text + "\n" + text2).strip() if text else text2
+                _usage = _usage2
+
+            _gen.update(
+                output=text or "",
+                usage_details={"input": _usage.input_tokens, "output": _usage.output_tokens} if _usage else None,
+            )
+    except Exception:
+        text, tool_calls, stop_reason, raw_content, _usage = call_agent(
             system_prompt=full_system,
             messages=messages,
             tools=api_tools if api_tools else None,
         )
-        if text2:
-            text = (text + "\n" + text2).strip() if text else text2
 
     return text, executed_calls

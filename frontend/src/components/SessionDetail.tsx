@@ -58,6 +58,7 @@ interface SessionData {
   trajectory_quality: string | null;
   experiment_type: string | null;
   task_id: string | null;
+  langfuse_trace_url: string | null;
   turns: Turn[];
   evaluation: Evaluation | null;
 }
@@ -438,6 +439,16 @@ export default function SessionDetail({ agentId }: { agentId: string }) {
         >
           {EXPERIMENT_TYPE_LABEL[expType] ?? expType}
         </span>
+        {data.langfuse_trace_url && (
+          <a
+            href={data.langfuse_trace_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="ml-auto px-2.5 py-1 rounded border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 text-xs transition-colors"
+          >
+            View Trace →
+          </a>
+        )}
       </div>
 
       {/* Summary cards */}

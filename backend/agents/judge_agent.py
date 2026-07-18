@@ -9,6 +9,7 @@ import re
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from observability import langfuse
 
 from agno.agent import Agent
 from agno.models.anthropic import Claude
@@ -174,8 +175,19 @@ TRANSCRIPT:
 
 Output your evaluation as a JSON object following the exact format specified in your instructions."""
 
-    response = judge.run(prompt)
-    response_text = response.content if response.content else ""
+    try:
+        with langfuse.start_as_current_observation(
+            name="judge-evaluation",
+            as_type="generation",
+            model="claude-sonnet-4-6",
+            input={"prompt": prompt},
+        ) as _judge_gen:
+            response = judge.run(prompt)
+            response_text = response.content if response.content else ""
+            _judge_gen.update(output=response_text)
+    except Exception:
+        response = judge.run(prompt)
+        response_text = response.content if response.content else ""
 
     # Extract JSON from response
     json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -356,17 +368,41 @@ TASK DESCRIPTION:
 
 Output your evaluation as a JSON object following the exact format in your instructions."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=TASK_JUDGE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    response_text = ""
-    for block in response.content:
-        if block.type == "text":
-            response_text += block.text
+    try:
+        with langfuse.start_as_current_observation(
+            name="judge-evaluation",
+            as_type="generation",
+            model="claude-sonnet-4-6",
+            input={"transcript": tool_log_str, "task": task_description},
+        ) as _judge_gen:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1024,
+                system=TASK_JUDGE_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response_text = ""
+            for block in response.content:
+                if block.type == "text":
+                    response_text += block.text
+            _judge_gen.update(
+                output=response_text,
+                usage_details={
+                    "input": response.usage.input_tokens,
+                    "output": response.usage.output_tokens,
+                },
+            )
+    except Exception:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=TASK_JUDGE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response_text = ""
+        for block in response.content:
+            if block.type == "text":
+                response_text += block.text
 
     json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
     if json_match:

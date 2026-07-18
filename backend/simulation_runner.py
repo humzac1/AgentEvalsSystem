@@ -22,8 +22,11 @@ from agents.agent_under_test import run_task_session, get_single_agent_reply
 from database import (
     init_db, save_session, save_turn, save_evaluation,
     get_active_prompt, get_all_tools, get_all_seed_data,
-    log_tool_call,
+    log_tool_call, update_session_trace_url,
 )
+from observability import langfuse
+from langfuse import propagate_attributes
+from langfuse.types import TraceContext
 
 CONVERSATION_COMPLETE_TOKEN = "[CONVERSATION_COMPLETE]"
 MAX_TURNS_PER_SIDE = 10  # Each side gets max 10 turns = 20 total
@@ -137,6 +140,15 @@ class SimulationRunner:
         self._log(f"Goal/Task  : {self.hidden_goal[:80]}")
         self._log(f"{'='*60}\n")
 
+        # ── Langfuse trace setup ──────────────────────────────────────
+        trace_id = langfuse.create_trace_id(seed=self.session_id)
+        base_url = os.getenv("LANGFUSE_BASE_URL", "https://us.cloud.langfuse.com").rstrip("/")
+        project_id = os.getenv("LANGFUSE_PROJECT_ID", "")
+        trace_url = f"{base_url}/project/{project_id}/traces/{trace_id}"
+
+        active_prompt = get_active_prompt(db_path=self.db_path)
+        prompt_version_num = active_prompt.get("version_number") if active_prompt else None
+
         save_session(
             self.session_id,
             self.user_profile,
@@ -150,10 +162,64 @@ class SimulationRunner:
             db_path=self.db_path,
         )
 
-        if self.experiment_type == "conversation":
-            return self._run_conversation()
-        else:
-            return self._run_task()
+        try:
+            update_session_trace_url(self.session_id, trace_url, db_path=self.db_path)
+        except Exception:
+            pass
+
+        result = {}
+        try:
+            with langfuse.start_as_current_observation(
+                name="simulation-session",
+                as_type="span",
+                trace_context=TraceContext(trace_id=trace_id),
+                metadata={
+                    "agent_name": self.agent_name,
+                    "experiment_type": self.experiment_type,
+                    "persona": self.persona_name,
+                    "difficulty": self.difficulty,
+                    "task_title": self.task_title or None,
+                    "prompt_version": prompt_version_num,
+                },
+            ) as root_span:
+                with propagate_attributes(session_id=self.session_id):
+                    if self.experiment_type == "conversation":
+                        result = self._run_conversation()
+                    else:
+                        result = self._run_task()
+
+                evaluation = result.get("evaluation", {})
+                root_span.update(output={
+                    "final_score": evaluation.get("total_score", 0),
+                    "trajectory_quality": evaluation.get("trajectory_quality", "low"),
+                })
+        except Exception as _e:
+            self._log(f"[WARNING] Langfuse tracing error: {_e}")
+            if not result:
+                if self.experiment_type == "conversation":
+                    result = self._run_conversation()
+                else:
+                    result = self._run_task()
+
+        # ── Log scores to Langfuse ────────────────────────────────────
+        evaluation = result.get("evaluation", {})
+        try:
+            for dim, val in evaluation.get("scores", {}).items():
+                if val is not None:
+                    langfuse.create_score(trace_id=trace_id, name=dim, value=float(val), data_type="NUMERIC")
+            total = evaluation.get("total_score", 0)
+            langfuse.create_score(trace_id=trace_id, name="total_score", value=float(total), data_type="NUMERIC")
+            goal_achieved = 1 if evaluation.get("hidden_goal_achieved") else 0
+            langfuse.create_score(trace_id=trace_id, name="goal_achieved", value=float(goal_achieved), data_type="NUMERIC")
+        except Exception:
+            pass
+
+        try:
+            langfuse.flush()
+        except Exception:
+            pass
+
+        return result
 
     # ── Conversation experiment ────────────────────────────────────────────────
 
@@ -193,9 +259,16 @@ class SimulationRunner:
             else:
                 user_prompt = self.transcript[-1]["message"]
 
+            user_message = ""
             try:
-                user_response = user_agent.run(user_prompt)
-                user_message = user_response.content if user_response.content else ""
+                with langfuse.start_as_current_observation(
+                    name=f"synthetic-user-turn-{user_turn_count + 1}",
+                    as_type="span",
+                    input={"persona": self.persona_name or self.user_profile, "prompt": user_prompt},
+                ) as _user_span:
+                    user_response = user_agent.run(user_prompt)
+                    user_message = user_response.content if user_response.content else ""
+                    _user_span.update(output={"message": user_message})
             except Exception as e:
                 self._log(f"[ERROR] User agent failed: {e}")
                 break
@@ -215,15 +288,6 @@ class SimulationRunner:
             # ── Agent turn ─────────────────────────────────────────────────
             try:
                 if executor:
-                    # Build messages list for Anthropic API
-                    api_messages = [
-                        {"role": t["speaker"] if t["speaker"] in ("user", "assistant") else
-                         ("user" if t["speaker"] == "user" else "assistant"),
-                         "content": t["message"]}
-                        for t in self.transcript
-                        if t["speaker"] in ("user", "agent")
-                    ]
-                    # Fix: map "agent" speaker to "assistant" role
                     api_messages = []
                     for t in self.transcript:
                         role = "user" if t["speaker"] == "user" else "assistant"
@@ -233,7 +297,6 @@ class SimulationRunner:
                         messages=api_messages,
                         executor=executor,
                     )
-                    # Persist tool calls
                     for tc in tool_calls:
                         log_tool_call(
                             session_id=self.session_id,
@@ -244,8 +307,15 @@ class SimulationRunner:
                             db_path=self.db_path,
                         )
                 else:
-                    hr_response = hr_reply_fn(clean_user_message, None)
-                    hr_message = hr_response.content if hasattr(hr_response, "content") else str(hr_response)
+                    with langfuse.start_as_current_observation(
+                        name=f"agent-turn-{hr_turn_count + 1}",
+                        as_type="generation",
+                        model="claude-sonnet-4-6",
+                        input={"message": clean_user_message},
+                    ) as _agent_gen:
+                        hr_response = hr_reply_fn(clean_user_message, None)
+                        hr_message = hr_response.content if hasattr(hr_response, "content") else str(hr_response)
+                        _agent_gen.update(output=hr_message)
             except Exception as e:
                 self._log(f"[ERROR] Agent failed: {e}")
                 break
@@ -357,7 +427,6 @@ You are operating in automated task execution mode. A task will be given to you 
             agent_name=self.agent_name,
             agent_domain=self.agent_domain,
         )
-        # Tag with experiment type for DB save
         evaluation["experiment_type"] = self.experiment_type
 
         save_evaluation(self.session_id, evaluation, db_path=self.db_path)
